@@ -1,0 +1,4242 @@
+"""
+assista_logic_v2.py — Cerveau d'ASSISTA v2.0
+=============================================
+Architecture radicalement supérieure en 9 couches :
+
+  [1] SQLite DB            → AssistaDatabaseV2    (cartographie PC, historique, préférences, routines)
+  [2] PC Mapper            → AssistaPCMapper      (scan complet en arrière-plan)
+  [3] Config               → AssistaConfig
+  [4] LLM                  → AssistaLLM           (stream_chat, complete_json, rotation modèles)
+  [5] Shell executor       → AssistaShell         (run_shell, audit, blacklist)
+  [6] Mémoire              → AssistaMemory        (faits, historique SQLite)
+  [7] Voix                 → AssistaVoice         (TTS + STT)
+  [8] 10 Agents spécialisés:
+        AgentFichiers / AgentDev / AgentReseau / AgentSysteme
+        AgentAutomatisation / AgentWeb / AgentClipboard
+        AgentNotifications / AgentPlanificateur / AgentSecurite
+  [9] Cerveau              → AssistaBrain         (orchestration + API publique)
+
+Nouveaux kinds d'actions :
+  clipboard_read / clipboard_write
+  notify / notify_toast
+  schedule / schedule_list / schedule_cancel
+  git / git_status / git_commit / git_push
+  network_scan / network_info / ping_host
+  install_package / uninstall_package / list_packages
+  db_query (interne)
+  run_python / run_script
+  env_get / env_set
+  zip_files / extract_zip
+  hash_file / diff_files
+"""
+
+# ── Imports stdlib ─────────────────────────────────────────────────────────────
+import ctypes
+import html
+import http.client
+import io
+import json
+import os
+import platform
+import queue
+import re
+import shutil
+import signal
+import socket
+import sqlite3
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+import uuid
+import webbrowser
+import zipfile
+import hashlib
+import audioop
+import base64
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+# ── Imports optionnels ─────────────────────────────────────────────────────────
+try:
+    import markdown as markdown_lib
+except Exception:
+    markdown_lib = None
+
+try:
+    from PIL import ImageGrab, Image
+except Exception:
+    ImageGrab = None
+    Image = None
+
+try:
+    import pytesseract
+except Exception:
+    pytesseract = None
+
+try:
+    import pyttsx3
+except Exception:
+    pyttsx3 = None
+
+try:
+    import speech_recognition as sr
+except Exception:
+    sr = None
+
+try:
+    import pyaudio
+except Exception:
+    pyaudio = None
+
+try:
+    import pyperclip
+except Exception:
+    pyperclip = None
+
+try:
+    import psutil
+except Exception:
+    psutil = None
+
+try:
+    from win10toast import ToastNotifier as _ToastNotifier
+except Exception:
+    _ToastNotifier = None
+
+try:
+    from pypdf import PdfReader
+except Exception:
+    try:
+        from PyPDF2 import PdfReader
+    except Exception:
+        PdfReader = None
+
+try:
+    from docx import Document as DocxDocument
+except Exception:
+    DocxDocument = None
+
+try:
+    import openpyxl
+except Exception:
+    openpyxl = None
+
+try:
+    from assista_commandes import try_command_match, export_commands_markdown
+    _COMMANDS_AVAILABLE = True
+except Exception:
+    try:
+        from assista.assista_commandes import try_command_match, export_commands_markdown
+        _COMMANDS_AVAILABLE = True
+    except Exception:
+        _COMMANDS_AVAILABLE = False
+        def try_command_match(prompt): return None
+        def export_commands_markdown(): return ""
+
+try:
+    from assista.ASSISTA_MODEL import AssistaTrainingModel
+except Exception:
+    try:
+        from ASSISTA_MODEL import AssistaTrainingModel
+    except Exception:
+        AssistaTrainingModel = None
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONSTANTES & CHEMINS
+# ══════════════════════════════════════════════════════════════════════════════
+PROJECT_ROOT          = Path(__file__).resolve().parent.parent
+DATA_DIR              = PROJECT_ROOT / "data" / "assista"
+CAPTURE_DIR           = DATA_DIR / "captures"
+LOG_DIR               = DATA_DIR / "logs"
+CONFIG_PATH           = DATA_DIR / "config.json"
+DB_PATH               = DATA_DIR / "assista_v2.db"       # ← SQLite principal
+ASSISTA_MODEL_DB_PATH = DATA_DIR / "assista_model.db"    # ← modèle d'apprentissage
+MEMORY_PATH           = DATA_DIR / "memory.json"          # ← mémoire JSON legacy
+SCRIPTS_DIR           = DATA_DIR / "scripts"
+
+for _d in [DATA_DIR, CAPTURE_DIR, LOG_DIR, SCRIPTS_DIR]:
+    _d.mkdir(parents=True, exist_ok=True)
+
+# ── LLM ──
+DEFAULT_MODEL    = "__auto__"   # mode auto par défaut (rotation des modèles)
+DEFAULT_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
+FALLBACK_MODELS  = [
+    "deepseek/deepseek-r1:free",
+    "google/gemini-2.0-flash-exp:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "mistralai/mistral-7b-instruct:free",
+    "qwen/qwen3-coder:free",
+]
+
+# ── Limites ──
+MAX_HISTORY_TURNS  = 20
+MAX_MEMORY_FACTS   = 200
+MAX_FILE_CHARS     = 14_000
+MAX_SHELL_TIMEOUT  = 30
+MAX_SEARCH_RESULTS = 20
+MAX_SCAN_DEPTH     = 4       # profondeur du PC Mapper (scan complet)
+MAX_SCAN_DEPTH_QUICK = 2    # profondeur scan rapide
+MAX_FILES_FULL     = 80_000 # limite fichiers scan complet
+MAX_FILES_QUICK    = 5_000  # limite fichiers scan rapide
+
+# ── Extensions ──
+TEXT_EXTENSIONS = {
+    ".txt", ".md", ".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".html",
+    ".css", ".xml", ".yaml", ".yml", ".csv", ".sql", ".bat", ".ps1",
+    ".log", ".ini", ".cfg", ".toml", ".java", ".c", ".cpp", ".cs",
+    ".go", ".rs", ".rb", ".php", ".sh", ".dart", ".r", ".h", ".m",
+    ".env", ".gitignore", ".dockerfile", ".vue", ".svelte",
+}
+READABLE_EXTENSIONS = TEXT_EXTENSIONS | {".pdf", ".docx", ".xlsx", ".xlsm"}
+
+# ── App aliases ──
+APP_ALIASES = {
+    "notepad": "notepad.exe", "bloc-notes": "notepad.exe",
+    "paint": "mspaint.exe", "calculatrice": "calc.exe", "calculator": "calc.exe",
+    "cmd": "cmd.exe", "terminal": "cmd.exe",
+    "powershell": "powershell.exe", "ps": "powershell.exe",
+    "explorer": "explorer.exe", "fichiers": "explorer.exe",
+    "settings": "ms-settings:", "parametres": "ms-settings:",
+    "chrome": "chrome.exe", "firefox": "firefox.exe",
+    "edge": "msedge.exe", "brave": "brave.exe",
+    "vscode": "code.exe", "code": "code.exe", "vs code": "code.exe",
+    "word": "WINWORD.EXE", "excel": "EXCEL.EXE",
+    "powerpoint": "POWERPNT.EXE", "outlook": "OUTLOOK.EXE",
+    "task-manager": "taskmgr.exe", "gestionnaire": "taskmgr.exe",
+    "gestionnaire de taches": "taskmgr.exe", "gestionnaire des tâches": "taskmgr.exe",
+    "appareil photo": "microsoft.windows.camera:",
+    "camera": "microsoft.windows.camera:", "caméra": "microsoft.windows.camera:",
+    "photos": "ms-photos:", "spotify": "spotify.exe", "vlc": "vlc.exe",
+    "teams": "ms-teams:", "zoom": "zoom.exe", "discord": "discord.exe",
+    "slack": "slack.exe", "telegram": "telegram.exe",
+    "snip": "ms-screenclip:", "capture": "ms-screenclip:",
+}
+
+# ── Tesseract ──
+def _find_tesseract() -> str:
+    candidates = [
+        shutil.which("tesseract"),
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        "/usr/bin/tesseract", "/usr/local/bin/tesseract",
+    ]
+    for c in candidates:
+        if c and Path(c).exists():
+            return c
+    return ""
+
+TESSERACT_PATH = _find_tesseract()
+if pytesseract and TESSERACT_PATH:
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  UTILITAIRES
+# ══════════════════════════════════════════════════════════════════════════════
+def now_iso() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def truncate(text: str, limit: int = 2000) -> str:
+    text = text or ""
+    return text if len(text) <= limit else text[:limit - 3] + "…"
+
+def normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip()).lower()
+
+def escape_html(text: str) -> str:
+    return html.escape(text or "").replace("\n", "<br>")
+
+def render_markdown(text: str) -> str:
+    safe = (text or "").replace("<script", "&lt;script")
+    if markdown_lib:
+        try:
+            return markdown_lib.markdown(safe, extensions=["fenced_code", "tables", "nl2br"])
+        except Exception:
+            pass
+    return escape_html(safe)
+
+def get_active_window_title() -> str:
+    try:
+        if platform.system() == "Windows":
+            buf = ctypes.create_unicode_buffer(512)
+            hwnd = ctypes.windll.user32.GetForegroundWindow()
+            ctypes.windll.user32.GetWindowTextW(hwnd, buf, 512)
+            return buf.value or ""
+    except Exception:
+        pass
+    return ""
+
+def choose_microphone_index() -> Optional[int]:
+    if sr is None:
+        return None
+    try:
+        names = sr.Microphone.list_microphone_names()
+    except Exception:
+        return None
+    if not names:
+        return None
+    preferred = ["microphone", "micro", "mic", "headset", "realtek", "input", "capture"]
+    rejected  = ["stereo mix", "mixage stereo", "loopback", "output", "speaker", "haut-parleur"]
+    fallback  = 0
+    for idx, name in enumerate(names):
+        n = normalize_text(name)
+        if any(t in n for t in rejected):
+            continue
+        if any(t in n for t in preferred):
+            return idx
+        fallback = idx
+    return fallback
+
+def prepare_tts_text(text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"```[\s\S]*?```", "code.", text)
+    text = re.sub(r"`[^`]+`", "code", text)
+    text = re.sub(r"#{1,6}\s*", "", text)
+    text = re.sub(r"\*{1,2}([^*]+)\*{1,2}", r"\1", text)
+    text = re.sub(r"https?://\S+", "lien web", text)
+    text = re.sub(r"[_~]", "", text)
+    return truncate(text.strip(), 500)
+
+def human_size(n: int) -> str:
+    for unit in ["o", "Ko", "Mo", "Go", "To"]:
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} Po"
+
+# ── Contrôle clavier/souris (Windows) ────────────────────────────────────────
+def _get_foreground_hwnd() -> int:
+    try:
+        return ctypes.windll.user32.GetForegroundWindow()
+    except Exception:
+        return 0
+
+_VK_MAP: Dict[str, int] = {
+    "enter": 0x0D, "return": 0x0D, "tab": 0x09, "escape": 0x1B, "esc": 0x1B,
+    "space": 0x20, "backspace": 0x08, "delete": 0x2E, "insert": 0x2D,
+    "home": 0x24, "end": 0x23, "pageup": 0x21, "pagedown": 0x22,
+    "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28,
+    "f1": 0x70, "f2": 0x71, "f3": 0x72, "f4": 0x73, "f5": 0x74,
+    "f6": 0x75, "f7": 0x76, "f8": 0x77, "f9": 0x78, "f10": 0x79,
+    "f11": 0x7A, "f12": 0x7B,
+    "ctrl": 0x11, "control": 0x11, "alt": 0x12, "shift": 0x10,
+    "win": 0x5B, "windows": 0x5B,
+    "a": 0x41, "b": 0x42, "c": 0x43, "d": 0x44, "e": 0x45,
+    "f": 0x46, "g": 0x47, "h": 0x48, "i": 0x49, "j": 0x4A,
+    "k": 0x4B, "l": 0x4C, "m": 0x4D, "n": 0x4E, "o": 0x4F,
+    "p": 0x50, "q": 0x51, "r": 0x52, "s": 0x53, "t": 0x54,
+    "u": 0x55, "v": 0x56, "w": 0x57, "x": 0x58, "y": 0x59, "z": 0x5A,
+    "0": 0x30, "1": 0x31, "2": 0x32, "3": 0x33, "4": 0x34,
+    "5": 0x35, "6": 0x36, "7": 0x37, "8": 0x38, "9": 0x39,
+}
+
+def _vk_key(name: str) -> int:
+    return _VK_MAP.get(normalize_text(name), 0)
+
+def _send_vk(vk: int, down: bool = True) -> None:
+    if platform.system() != "Windows" or not vk:
+        return
+    try:
+        flag = 0 if down else 2
+        ctypes.windll.user32.keybd_event(vk, 0, flag, 0)
+    except Exception:
+        pass
+
+def read_clipboard_text() -> str:
+    """Lit le presse-papiers (Windows natif ou pyperclip)."""
+    if platform.system() == "Windows":
+        try:
+            u32 = ctypes.windll.user32
+            k32 = ctypes.windll.kernel32
+            CF_UNICODETEXT = 13
+            if not u32.OpenClipboard(0):
+                return ""
+            try:
+                handle = u32.GetClipboardData(CF_UNICODETEXT)
+                if not handle:
+                    return ""
+                ptr = k32.GlobalLock(handle)
+                if not ptr:
+                    return ""
+                try:
+                    return ctypes.wstring_at(ptr)
+                finally:
+                    k32.GlobalUnlock(handle)
+            finally:
+                u32.CloseClipboard()
+        except Exception:
+            pass
+    if pyperclip is not None:
+        try:
+            return pyperclip.paste() or ""
+        except Exception:
+            pass
+    return ""
+
+def write_clipboard_text(text: str) -> bool:
+    """Écrit dans le presse-papiers (Windows natif ou pyperclip)."""
+    if platform.system() == "Windows":
+        try:
+            u32 = ctypes.windll.user32
+            k32 = ctypes.windll.kernel32
+            CF_UNICODETEXT = 13
+            encoded = (text + "\0").encode("utf-16-le")
+            size    = len(encoded)
+            hmem    = k32.GlobalAlloc(0x0002, size)
+            if not hmem:
+                return False
+            ptr = k32.GlobalLock(hmem)
+            if not ptr:
+                k32.GlobalFree(hmem)
+                return False
+            ctypes.memmove(ptr, encoded, size)
+            k32.GlobalUnlock(hmem)
+            if not u32.OpenClipboard(0):
+                k32.GlobalFree(hmem)
+                return False
+            try:
+                u32.EmptyClipboard()
+                u32.SetClipboardData(CF_UNICODETEXT, hmem)
+                return True
+            finally:
+                u32.CloseClipboard()
+        except Exception:
+            pass
+    if pyperclip is not None:
+        try:
+            pyperclip.copy(text)
+            return True
+        except Exception:
+            pass
+    return False
+
+def parse_schedule_spec(spec: str, now: Optional[datetime] = None) -> Dict:
+    """
+    Analyse une spec de planification.
+    Formats supportés :
+      - "dans 10 minutes" / "in 5 min" → once
+      - "dans 2 heures"                → once
+      - "tous les 30 minutes"          → interval
+      - "chaque jour à 09:00"          → daily
+      - "2024-12-31 08:00"             → once (datetime ISO)
+    """
+    if now is None:
+        now = datetime.now()
+    s = normalize_text(spec)
+    # interval : "toutes les X minutes/heures"
+    m = re.search(r"(toutes?|every|tous?\s*les?)\s+(\d+)\s*(min|minute|heure|hour|sec|seconde|second)", s)
+    if m:
+        val = int(m.group(2))
+        unit = m.group(3)
+        if "sec" in unit:
+            secs = val
+        elif "min" in unit:
+            secs = val * 60
+        else:
+            secs = val * 3600
+        return {"ok": True, "kind": "interval", "seconds": secs}
+    # once : "dans X minutes/heures"
+    m = re.search(r"(dans?|in)\s+(\d+)\s*(min|minute|heure|hour|sec|seconde|second)", s)
+    if m:
+        val = int(m.group(2))
+        unit = m.group(3)
+        if "sec" in unit:
+            delta = timedelta(seconds=val)
+        elif "min" in unit:
+            delta = timedelta(minutes=val)
+        else:
+            delta = timedelta(hours=val)
+        return {"ok": True, "kind": "once", "when": now + delta}
+    # daily : "chaque jour à HH:MM" / "every day at HH:MM"
+    m = re.search(r"(chaque\s+jour|every\s+day|daily)\s+[aà]\s+(\d{1,2})[h:](\d{2})?", s)
+    if m:
+        h = int(m.group(2))
+        mn = int(m.group(3) or 0)
+        return {"ok": True, "kind": "daily", "hour": h, "minute": mn}
+    # ISO datetime
+    m = re.search(r"(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})", s)
+    if m:
+        try:
+            when = datetime.strptime(f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H:%M")
+            return {"ok": True, "kind": "once", "when": when}
+        except ValueError:
+            pass
+    return {"ok": False, "reason": f"Format de planification non reconnu : {spec}"}
+
+def infer_agent_key(kind: str) -> str:
+    """Déduit l'agent responsable d'un kind d'action."""
+    _MAP = {
+        "read_file":"AgentFichiers","create_text_file":"AgentFichiers",
+        "write_file":"AgentFichiers","delete_file":"AgentFichiers",
+        "move_file":"AgentFichiers","copy_file":"AgentFichiers",
+        "list_dir":"AgentFichiers","search_files":"AgentFichiers",
+        "zip_files":"AgentFichiers","hash_file":"AgentFichiers",
+        "diff_files":"AgentFichiers","extract_zip":"AgentFichiers",
+        "run_shell":"AgentDev","run_python":"AgentDev","run_script":"AgentDev",
+        "git":"AgentDev","git_status":"AgentDev","git_commit":"AgentDev",
+        "install_package":"AgentDev","list_packages":"AgentDev",
+        "network_scan":"AgentReseau","network_info":"AgentReseau",
+        "ping_host":"AgentReseau","port_scan":"AgentReseau",
+        "system_info":"AgentSysteme","list_processes":"AgentSysteme",
+        "kill_process":"AgentSysteme","env_get":"AgentSysteme","env_set":"AgentSysteme",
+        "schedule":"AgentPlanificateur","schedule_list":"AgentPlanificateur",
+        "routine_add":"AgentPlanificateur",
+        "open_url":"AgentWeb","web_search":"AgentWeb",
+        "clipboard_read":"AgentClipboard","clipboard_write":"AgentClipboard",
+        "notify":"AgentNotifications","notify_toast":"AgentNotifications",
+        "capture_screen":"AgentSysteme","analyze_screen":"AgentSysteme",
+        "security_audit":"AgentSecurite","hash_file":"AgentSecurite",
+    }
+    return _MAP.get(kind, "AgentSysteme")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DATACLASSES
+# ══════════════════════════════════════════════════════════════════════════════
+@dataclass
+class ActionProposal:
+    id:               str
+    kind:             str
+    title:            str
+    target:           str = ""
+    command:          str = ""
+    summary:          str = ""
+    meta:             Dict = field(default_factory=dict)
+    risk:             str = "safe"
+    requires_confirm: bool = False
+    requires_approval: bool = False
+
+@dataclass
+class TaskPlan:
+    id:         str
+    summary:    str
+    steps:      List[ActionProposal] = field(default_factory=list)
+    created_at: str = field(default_factory=now_iso)
+
+@dataclass
+class ScheduledTask:
+    id:          str
+    label:       str
+    command:     str
+    kind:        str = "run_shell"
+    run_at:      Optional[str] = None   # ISO datetime
+    interval_s:  int = 0                # 0 = one-shot
+    enabled:     bool = True
+    last_run:    Optional[str] = None
+    next_run:    Optional[str] = None
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  COUCHE 1 — BASE DE DONNÉES SQLite
+# ══════════════════════════════════════════════════════════════════════════════
+class AssistaDatabaseV2:
+    """
+    Base SQLite centrale d'ASSISTA v2.
+    Tables :
+      - pc_map          : cartographie complète du PC (fichiers, apps, partitions)
+      - preferences     : préférences utilisateur clé/valeur
+      - facts           : faits mémorisés (remplace memory.json)
+      - history         : historique de toutes les conversations
+      - shell_audit     : journal des commandes shell
+      - routines        : routines automatisées définies par l'utilisateur
+      - scheduled_tasks : tâches planifiées
+      - notifications   : notifications envoyées
+      - packages        : packages installés (pip, npm, choco)
+      - network_scans   : résultats de scans réseau
+    """
+
+    # ── Schéma ────────────────────────────────────────────────────────────────
+    SCHEMA = """
+    PRAGMA journal_mode=WAL;
+    PRAGMA foreign_keys=ON;
+
+    CREATE TABLE IF NOT EXISTS pc_map (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        path        TEXT NOT NULL,
+        type        TEXT NOT NULL,           -- 'file' | 'dir' | 'app' | 'partition'
+        size_bytes  INTEGER DEFAULT 0,
+        ext         TEXT DEFAULT '',
+        label       TEXT DEFAULT '',
+        scanned_at  TEXT NOT NULL,
+        extra       TEXT DEFAULT '{}'
+    );
+    CREATE INDEX IF NOT EXISTS idx_pcmap_path ON pc_map(path);
+    CREATE INDEX IF NOT EXISTS idx_pcmap_ext  ON pc_map(ext);
+
+    CREATE TABLE IF NOT EXISTS preferences (
+        key         TEXT PRIMARY KEY,
+        value       TEXT NOT NULL,
+        updated_at  TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS facts (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        content     TEXT NOT NULL UNIQUE,
+        source      TEXT DEFAULT 'user',
+        created_at  TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS history (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        conv_id     TEXT NOT NULL,
+        role        TEXT NOT NULL,
+        content     TEXT NOT NULL,
+        ts          TEXT NOT NULL,
+        source      TEXT DEFAULT 'text'
+    );
+    CREATE INDEX IF NOT EXISTS idx_history_conv ON history(conv_id);
+
+    CREATE TABLE IF NOT EXISTS shell_audit (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        command     TEXT NOT NULL,
+        status      TEXT NOT NULL,
+        detail      TEXT DEFAULT '',
+        ts          TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS routines (
+        id          TEXT PRIMARY KEY,
+        label       TEXT NOT NULL,
+        trigger_kw  TEXT NOT NULL,
+        steps       TEXT NOT NULL,           -- JSON
+        enabled     INTEGER DEFAULT 1,
+        created_at  TEXT NOT NULL,
+        last_used   TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS scheduled_tasks (
+        id          TEXT PRIMARY KEY,
+        label       TEXT NOT NULL,
+        command     TEXT NOT NULL,
+        kind        TEXT DEFAULT 'run_shell',
+        run_at      TEXT,
+        interval_s  INTEGER DEFAULT 0,
+        enabled     INTEGER DEFAULT 1,
+        last_run    TEXT,
+        next_run    TEXT,
+        created_at  TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS notifications (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        title       TEXT NOT NULL,
+        body        TEXT NOT NULL,
+        sent_at     TEXT NOT NULL,
+        method      TEXT DEFAULT 'toast'
+    );
+
+    CREATE TABLE IF NOT EXISTS packages (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        name        TEXT NOT NULL,
+        version     TEXT DEFAULT '',
+        manager     TEXT NOT NULL,           -- pip | npm | choco | winget
+        scanned_at  TEXT NOT NULL,
+        UNIQUE(name, manager)
+    );
+
+    CREATE TABLE IF NOT EXISTS network_scans (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        host        TEXT NOT NULL,
+        port        INTEGER,
+        status      TEXT NOT NULL,
+        latency_ms  REAL,
+        scanned_at  TEXT NOT NULL
+    );
+    """
+
+    def __init__(self, db_path: Path = DB_PATH):
+        self._path = str(db_path)
+        self._local = threading.local()
+        self._init()
+
+    def _conn(self) -> sqlite3.Connection:
+        if not getattr(self._local, "conn", None):
+            conn = sqlite3.connect(self._path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            self._local.conn = conn
+        return self._local.conn
+
+    def _init(self):
+        with self._tx() as c:
+            c.executescript(self.SCHEMA)
+
+    @contextmanager
+    def _tx(self):
+        conn = self._conn()
+        cur  = conn.cursor()
+        try:
+            yield cur
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    # ── Preferences ───────────────────────────────────────────────────────────
+    def pref_set(self, key: str, value: Any) -> None:
+        with self._tx() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO preferences(key,value,updated_at) VALUES(?,?,?)",
+                (key, json.dumps(value, ensure_ascii=False), now_iso())
+            )
+
+    def pref_get(self, key: str, default: Any = None) -> Any:
+        conn = self._conn()
+        row  = conn.execute("SELECT value FROM preferences WHERE key=?", (key,)).fetchone()
+        if row is None:
+            return default
+        try:
+            return json.loads(row["value"])
+        except Exception:
+            return row["value"]
+
+    def pref_all(self) -> Dict:
+        conn = self._conn()
+        rows = conn.execute("SELECT key, value FROM preferences").fetchall()
+        return {r["key"]: json.loads(r["value"]) for r in rows}
+
+    # ── Facts (mémoire persistante) ────────────────────────────────────────────
+    def fact_add(self, content: str, source: str = "auto") -> None:
+        content = (content or "").strip()
+        if not content:
+            return
+        with self._tx() as c:
+            c.execute(
+                "INSERT OR IGNORE INTO facts(content,source,created_at) VALUES(?,?,?)",
+                (content, source, now_iso())
+            )
+        # Purge si trop
+        conn = self._conn()
+        count = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        if count > MAX_MEMORY_FACTS:
+            with self._tx() as c:
+                c.execute(
+                    "DELETE FROM facts WHERE id IN "
+                    "(SELECT id FROM facts ORDER BY id ASC LIMIT ?)",
+                    (count - MAX_MEMORY_FACTS,)
+                )
+
+    def fact_list(self, n: int = 50) -> List[str]:
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT content FROM facts ORDER BY id DESC LIMIT ?", (n,)
+        ).fetchall()
+        return [r["content"] for r in rows]
+
+    def fact_clear(self) -> None:
+        with self._tx() as c:
+            c.execute("DELETE FROM facts")
+
+    # ── History ───────────────────────────────────────────────────────────────
+    def history_add(self, conv_id: str, role: str, content: str, source: str = "text") -> None:
+        with self._tx() as c:
+            c.execute(
+                "INSERT INTO history(conv_id,role,content,ts,source) VALUES(?,?,?,?,?)",
+                (conv_id, role, content, now_iso(), source)
+            )
+
+    def history_get(self, conv_id: str, n: int = 40) -> List[Dict]:
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT role,content,ts,source FROM history "
+            "WHERE conv_id=? ORDER BY id DESC LIMIT ?",
+            (conv_id, n)
+        ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
+    def history_convs(self) -> List[str]:
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT DISTINCT conv_id FROM history ORDER BY id DESC"
+        ).fetchall()
+        return [r["conv_id"] for r in rows]
+
+    # ── Shell audit ───────────────────────────────────────────────────────────
+    def audit_add(self, command: str, status: str, detail: str = "") -> None:
+        with self._tx() as c:
+            c.execute(
+                "INSERT INTO shell_audit(command,status,detail,ts) VALUES(?,?,?,?)",
+                (truncate(command, 500), status, detail, now_iso())
+            )
+
+    def audit_get(self, n: int = 50) -> List[Dict]:
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT command,status,detail,ts FROM shell_audit ORDER BY id DESC LIMIT ?",
+            (n,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── PC Map ────────────────────────────────────────────────────────────────
+    def pcmap_clear(self) -> None:
+        with self._tx() as c:
+            c.execute("DELETE FROM pc_map")
+
+    def pcmap_insert_many(self, rows: List[Dict]) -> None:
+        with self._tx() as c:
+            c.executemany(
+                "INSERT OR REPLACE INTO pc_map(path,type,size_bytes,ext,label,scanned_at,extra) "
+                "VALUES(:path,:type,:size_bytes,:ext,:label,:scanned_at,:extra)",
+                rows
+            )
+
+    def pcmap_search(self, query: str, limit: int = 30) -> List[Dict]:
+        conn = self._conn()
+        q    = f"%{query.lower()}%"
+        rows = conn.execute(
+            "SELECT path,type,size_bytes,ext,label FROM pc_map "
+            "WHERE lower(path) LIKE ? OR lower(label) LIKE ? LIMIT ?",
+            (q, q, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def pcmap_count(self) -> int:
+        return self._conn().execute("SELECT COUNT(*) FROM pc_map").fetchone()[0]
+
+    def pcmap_stats(self) -> Dict:
+        conn = self._conn()
+        total     = conn.execute("SELECT COUNT(*) FROM pc_map").fetchone()[0]
+        files     = conn.execute("SELECT COUNT(*) FROM pc_map WHERE type='file'").fetchone()[0]
+        dirs      = conn.execute("SELECT COUNT(*) FROM pc_map WHERE type='dir'").fetchone()[0]
+        top_exts  = conn.execute(
+            "SELECT ext, COUNT(*) cnt FROM pc_map WHERE type='file' AND ext!='' "
+            "GROUP BY ext ORDER BY cnt DESC LIMIT 10"
+        ).fetchall()
+        return {
+            "total": total, "files": files, "dirs": dirs,
+            "top_extensions": [dict(r) for r in top_exts],
+        }
+
+    # ── Routines ──────────────────────────────────────────────────────────────
+    def routine_add(self, label: str, trigger_kw: str, steps: List[Dict]) -> str:
+        rid = str(uuid.uuid4())
+        with self._tx() as c:
+            c.execute(
+                "INSERT INTO routines(id,label,trigger_kw,steps,enabled,created_at) "
+                "VALUES(?,?,?,?,1,?)",
+                (rid, label, trigger_kw, json.dumps(steps, ensure_ascii=False), now_iso())
+            )
+        return rid
+
+    def routine_list(self) -> List[Dict]:
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT id,label,trigger_kw,steps,enabled,created_at,last_used "
+            "FROM routines WHERE enabled=1"
+        ).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["steps"] = json.loads(d["steps"])
+            result.append(d)
+        return result
+
+    def routine_match(self, prompt: str) -> Optional[Dict]:
+        lower = normalize_text(prompt)
+        for r in self.routine_list():
+            if normalize_text(r["trigger_kw"]) in lower:
+                return r
+        return None
+
+    def routine_delete(self, rid: str) -> None:
+        with self._tx() as c:
+            c.execute("DELETE FROM routines WHERE id=?", (rid,))
+
+    # ── Scheduled tasks ───────────────────────────────────────────────────────
+    def task_add(self, task: ScheduledTask) -> None:
+        with self._tx() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO scheduled_tasks "
+                "(id,label,command,kind,run_at,interval_s,enabled,last_run,next_run,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (task.id, task.label, task.command, task.kind,
+                 task.run_at, task.interval_s, int(task.enabled),
+                 task.last_run, task.next_run, now_iso())
+            )
+
+    def task_list(self) -> List[Dict]:
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT * FROM scheduled_tasks WHERE enabled=1 ORDER BY next_run"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def task_delete(self, tid: str) -> None:
+        with self._tx() as c:
+            c.execute("DELETE FROM scheduled_tasks WHERE id=?", (tid,))
+
+    def task_update_run(self, tid: str, last_run: str, next_run: Optional[str]) -> None:
+        with self._tx() as c:
+            c.execute(
+                "UPDATE scheduled_tasks SET last_run=?, next_run=? WHERE id=?",
+                (last_run, next_run, tid)
+            )
+
+    # ── Notifications ─────────────────────────────────────────────────────────
+    def notif_add(self, title: str, body: str, method: str = "toast") -> None:
+        with self._tx() as c:
+            c.execute(
+                "INSERT INTO notifications(title,body,sent_at,method) VALUES(?,?,?,?)",
+                (title, body, now_iso(), method)
+            )
+
+    def notif_list(self, n: int = 20) -> List[Dict]:
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT title,body,sent_at,method FROM notifications ORDER BY id DESC LIMIT ?",
+            (n,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Packages ──────────────────────────────────────────────────────────────
+    def packages_update(self, packages: List[Dict]) -> None:
+        ts = now_iso()
+        with self._tx() as c:
+            for pkg in packages:
+                c.execute(
+                    "INSERT OR REPLACE INTO packages(name,version,manager,scanned_at) "
+                    "VALUES(?,?,?,?)",
+                    (pkg["name"], pkg.get("version", ""), pkg["manager"], ts)
+                )
+
+    def packages_list(self, manager: Optional[str] = None) -> List[Dict]:
+        conn = self._conn()
+        if manager:
+            rows = conn.execute(
+                "SELECT name,version,manager,scanned_at FROM packages WHERE manager=? "
+                "ORDER BY name", (manager,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT name,version,manager,scanned_at FROM packages ORDER BY manager,name"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Network scans ─────────────────────────────────────────────────────────
+    def netscan_add(self, host: str, port: Optional[int], status: str,
+                    latency_ms: Optional[float] = None) -> None:
+        with self._tx() as c:
+            c.execute(
+                "INSERT INTO network_scans(host,port,status,latency_ms,scanned_at) "
+                "VALUES(?,?,?,?,?)",
+                (host, port, status, latency_ms, now_iso())
+            )
+
+    def netscan_recent(self, n: int = 20) -> List[Dict]:
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT host,port,status,latency_ms,scanned_at FROM network_scans "
+            "ORDER BY id DESC LIMIT ?", (n,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Raw query (agent DB) ───────────────────────────────────────────────────
+    def raw_query(self, sql: str, params: tuple = ()) -> List[Dict]:
+        conn = self._conn()
+        rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  COUCHE 2 — PC MAPPER (scan complet en arrière-plan)
+# ══════════════════════════════════════════════════════════════════════════════
+class AssistaPCMapper:
+    """
+    Scanne le PC en arrière-plan et stocke la cartographie dans SQLite.
+    Scan incrémental : re-scanne uniquement les chemins modifiés.
+    """
+
+    SKIP_DIRS = {
+        "$Recycle.Bin", "Windows", "System32", "SysWOW64", "WinSxS",
+        "node_modules", ".git", "__pycache__", ".venv", "venv",
+        "AppData\\Local\\Temp", "AppData\\Local\\Microsoft\\Windows",
+    }
+
+    def __init__(self, db: AssistaDatabaseV2):
+        self._db       = db
+        self._running  = False
+        self._thread: Optional[threading.Thread] = None
+        self._progress = {
+            "status":          "idle",
+            "scanned":         0,
+            "total_estimate":  0,
+            "progress_percent":0,
+            "current_path":    "",
+            "current_root":    "",
+            "scanned_files":   0,
+            "scanned_dirs":    0,
+            "running":         False,
+            "message":         "En attente de scan.",
+        }
+        self._lock     = threading.Lock()
+        self._max_files= MAX_FILES_FULL
+
+    @property
+    def progress(self) -> Dict:
+        with self._lock:
+            return dict(self._progress)
+
+    def start(self, full: bool = False, quick: bool = False) -> None:
+        if self._running:
+            return
+        self._running   = True
+        self._max_files = MAX_FILES_QUICK if quick else MAX_FILES_FULL
+        mode = "rapide" if quick else ("complet" if full else "standard")
+        self._set_progress("scanning", 0, 0, message=f"Démarrage scan {mode}…")
+        self._thread = threading.Thread(
+            target=self._run, args=(full, quick), daemon=True, name="PCMapper"
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+
+    def _run(self, full: bool, quick: bool = False) -> None:
+        try:
+            if full:
+                self._db.pcmap_clear()
+            if quick:
+                self._scan_quick()
+            else:
+                self._scan_home()
+                if self._running:
+                    self._scan_installed_apps()
+                if self._running:
+                    self._scan_packages()
+            count = self._db.pcmap_count()
+            self._set_progress("done", count, count, message=f"Scan terminé — {count:,} entrées indexées.", percent=100)
+        except Exception as e:
+            self._set_progress(f"error", 0, 0, message=f"Erreur scan : {e}")
+        finally:
+            self._running = False
+
+    def _scan_quick(self) -> None:
+        """Scan rapide : dossiers utilisateur importants, profondeur 2, max 5 000 fichiers."""
+        home = Path.home()
+        quick_dirs = [
+            home / "Desktop",   home / "Bureau",
+            home / "Documents", home / "Downloads",
+            home / "Pictures",  home / "Music",
+            PROJECT_ROOT,
+        ]
+        batch = []
+        for d in quick_dirs:
+            if not d.exists() or not d.is_dir():
+                continue
+            self._set_progress("scanning", self._db.pcmap_count(), MAX_FILES_QUICK,
+                               current_root=str(d),
+                               message=f"Scan rapide : {d.name}…")
+            self._walk_dir(d, batch, depth=0, max_depth=MAX_SCAN_DEPTH_QUICK)
+            if not self._running:
+                break
+        if batch:
+            self._db.pcmap_insert_many(batch)
+
+    def _set_progress(self, status: str, scanned: int, total: int,
+                      current_path: str = "", current_root: str = "",
+                      message: str = "", percent: int = -1) -> None:
+        pct = percent if percent >= 0 else (
+            min(99, int(100 * scanned / total)) if total > 0 else 0
+        )
+        with self._lock:
+            self._progress = {
+                "status":           status,
+                "scanned":          scanned,
+                "total_estimate":   total,
+                "progress_percent": pct,
+                "current_path":     current_path,
+                "current_root":     current_root,
+                "scanned_files":    scanned,
+                "scanned_dirs":     0,
+                "running":          self._running,
+                "message":          message or status,
+            }
+
+    def _scan_partitions(self) -> None:
+        rows = []
+        if platform.system() == "Windows":
+            try:
+                import ctypes as ct
+                drives = []
+                bitmask = ct.windll.kernel32.GetLogicalDrives()
+                for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+                    if bitmask & 1:
+                        drives.append(letter + ":\\")
+                    bitmask >>= 1
+                for drive in drives:
+                    try:
+                        total, used, free = shutil.disk_usage(drive)
+                        rows.append({
+                            "path": drive, "type": "partition",
+                            "size_bytes": total, "ext": "",
+                            "label": f"{drive} ({human_size(free)} libre / {human_size(total)})",
+                            "scanned_at": now_iso(),
+                            "extra": json.dumps({"free": free, "used": used, "total": total})
+                        })
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        else:
+            try:
+                total, used, free = shutil.disk_usage("/")
+                rows.append({
+                    "path": "/", "type": "partition",
+                    "size_bytes": total, "ext": "",
+                    "label": f"/ ({human_size(free)} libre / {human_size(total)})",
+                    "scanned_at": now_iso(),
+                    "extra": json.dumps({"free": free, "used": used, "total": total})
+                })
+            except Exception:
+                pass
+        if rows:
+            self._db.pcmap_insert_many(rows)
+
+    def _scan_home(self) -> None:
+        home    = Path.home()
+        key_dirs = [
+            home / "Desktop",   home / "Bureau",
+            home / "Documents", home / "Downloads", home / "Téléchargements",
+            home / "Pictures",  home / "Images",
+            home / "Music",     home / "Musique",
+            home / "Videos",    home / "Vidéos",
+            home / "Projects",  home / "Dev",       home / "Code",
+            PROJECT_ROOT,
+        ]
+        batch = []
+        for d in key_dirs:
+            if not d.exists() or not d.is_dir():
+                continue
+            self._set_progress("scanning", self._progress.get("scanned", 0),
+                               self._max_files, current_root=str(d),
+                               message=f"Scan : {d.name}…")
+            self._walk_dir(d, batch, depth=0)
+            if not self._running:
+                break
+        if batch:
+            self._db.pcmap_insert_many(batch)
+
+    def _walk_dir(self, path: Path, batch: List[Dict], depth: int,
+                  max_depth: int = MAX_SCAN_DEPTH) -> None:
+        if depth > max_depth or not self._running:
+            return
+        # Limite globale de fichiers
+        current_count = self._progress.get("scanned", 0)
+        if current_count >= self._max_files:
+            self._running = False
+            return
+        # Skip répertoires systèmes
+        for skip in self.SKIP_DIRS:
+            if skip.lower() in str(path).lower():
+                return
+        try:
+            for item in path.iterdir():
+                if not self._running:
+                    return
+                try:
+                    if item.is_dir():
+                        batch.append({
+                            "path": str(item), "type": "dir",
+                            "size_bytes": 0, "ext": "",
+                            "label": item.name, "scanned_at": now_iso(), "extra": "{}"
+                        })
+                        self._walk_dir(item, batch, depth + 1, max_depth)
+                    elif item.is_file():
+                        size = 0
+                        try:
+                            size = item.stat().st_size
+                        except Exception:
+                            pass
+                        batch.append({
+                            "path": str(item), "type": "file",
+                            "size_bytes": size, "ext": item.suffix.lower(),
+                            "label": item.name, "scanned_at": now_iso(), "extra": "{}"
+                        })
+                        with self._lock:
+                            self._progress["scanned"] += 1
+                            self._progress["scanned_files"] = self._progress["scanned"]
+                            self._progress["current_path"] = str(item)
+                            pct = min(99, int(100 * self._progress["scanned"] / self._max_files))
+                            self._progress["progress_percent"] = pct
+                            self._progress["running"] = True
+                        # Pause toutes les 200 entrées pour laisser l'OS respirer
+                        # et garantir que le mapper lit vraiment chaque fichier
+                        if self._progress["scanned"] % 200 == 0:
+                            time.sleep(0.05)
+                        if self._progress["scanned"] >= self._max_files:
+                            self._running = False
+                            return
+                    if len(batch) >= 500:
+                        self._db.pcmap_insert_many(batch)
+                        batch.clear()
+                except Exception:
+                    continue
+        except PermissionError:
+            pass
+
+    def _scan_installed_apps(self) -> None:
+        rows = []
+        if platform.system() == "Windows":
+            # Scan PATH
+            for p in os.environ.get("PATH", "").split(os.pathsep):
+                d = Path(p)
+                if not d.exists():
+                    continue
+                try:
+                    for f in d.glob("*.exe"):
+                        rows.append({
+                            "path": str(f), "type": "app",
+                            "size_bytes": 0, "ext": ".exe",
+                            "label": f.stem, "scanned_at": now_iso(), "extra": "{}"
+                        })
+                except Exception:
+                    pass
+        if rows:
+            self._db.pcmap_insert_many(rows)
+
+    def _scan_packages(self) -> None:
+        packages = []
+        # pip
+        try:
+            out = subprocess.run(
+                [sys.executable, "-m", "pip", "list", "--format=json"],
+                capture_output=True, text=True, timeout=20
+            )
+            if out.returncode == 0:
+                for pkg in json.loads(out.stdout):
+                    packages.append({"name": pkg["name"], "version": pkg["version"], "manager": "pip"})
+        except Exception:
+            pass
+        # npm global
+        try:
+            out = subprocess.run(
+                ["npm", "list", "-g", "--depth=0", "--json"],
+                capture_output=True, text=True, timeout=20
+            )
+            if out.returncode == 0:
+                data = json.loads(out.stdout)
+                for name, info in (data.get("dependencies") or {}).items():
+                    packages.append({"name": name, "version": info.get("version", ""), "manager": "npm"})
+        except Exception:
+            pass
+        if packages:
+            self._db.packages_update(packages)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  COUCHE 3 — CONFIG
+# ══════════════════════════════════════════════════════════════════════════════
+class AssistaConfig:
+    _DEFAULTS = {
+        "api_key":  "",
+        "model":    DEFAULT_MODEL,
+        "base_url": DEFAULT_BASE_URL,
+    }
+
+    def __init__(self, db: AssistaDatabaseV2):
+        self._db = db
+
+    def load(self) -> Dict:
+        cfg = dict(self._DEFAULTS)
+        for k in cfg:
+            v = self._db.pref_get(f"config.{k}")
+            if v is not None:
+                cfg[k] = v
+        # Fallback fichier JSON legacy
+        if not cfg["api_key"] and CONFIG_PATH.exists():
+            try:
+                old = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+                cfg["api_key"]  = old.get("api_key",  cfg["api_key"])
+                cfg["model"]    = old.get("model",    cfg["model"])
+                cfg["base_url"] = old.get("base_url", cfg["base_url"])
+            except Exception:
+                pass
+        # Clé API : priorité variable d'environnement si champ vide
+        env_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+        if not cfg["api_key"] and env_key:
+            cfg["api_key"]         = env_key
+            cfg["api_key_from_env"] = True
+        else:
+            cfg["api_key_from_env"] = False
+        # URL par défaut pré-remplie
+        if not cfg["base_url"]:
+            cfg["base_url"] = DEFAULT_BASE_URL
+        return cfg
+
+    def save(self, api_key: str, model: str, base_url: str) -> Dict:
+        cfg = {
+            "api_key":  (api_key  or "").strip(),
+            "model":    (model    or DEFAULT_MODEL).strip(),
+            "base_url": (base_url or DEFAULT_BASE_URL).strip(),
+        }
+        for k, v in cfg.items():
+            self._db.pref_set(f"config.{k}", v)
+        return cfg
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  COUCHE 4 — SYSTEM PROMPT ULTRA-ENRICHI
+# ══════════════════════════════════════════════════════════════════════════════
+SYSTEM_PROMPT_V2 = f"""\
+Tu es ASSISTA v2, une intelligence artificielle personnelle de niveau expert.
+Tu contrôles le PC de l'utilisateur avec une précision chirurgicale.
+Tu disposes d'une base de données SQLite complète (cartographie PC, historique,
+préférences, routines, tâches planifiées) et de 10 agents spécialisés.
+
+═══════════════ CHEMINS SYSTÈME IMPORTANTS ═══════════════
+
+• Bureau (Desktop) : {Path.home() / "Desktop"}
+• Documents : {Path.home() / "Documents"}
+• Téléchargements : {Path.home() / "Downloads"}
+• Images : {Path.home() / "Pictures"}
+• Musique : {Path.home() / "Music"}
+• Vidéos : {Path.home() / "Videos"}
+• Dossier utilisateur : {Path.home()}
+
+RÈGLE CRITIQUE sur les chemins :
+  - Toujours utiliser le chemin ABSOLU complet dans "target"
+  - Pour un fichier sur le bureau : target = "{Path.home() / "Desktop" / "nom_fichier.txt"}"
+  - Ne JAMAIS mettre juste "bureau/fichier.txt" — toujours le chemin complet
+
+═══════════════ RÈGLE FONDAMENTALE — CHAT vs ACTION ═══════════════
+
+⚡ PRIORITÉ ABSOLUE : Détermine D'ABORD si la demande est une CONVERSATION ou une ACTION.
+
+MODE CHAT (mode="chat", steps=[]) :
+  Exemples OBLIGATOIRES de réponses en mode chat :
+  - "Bonjour / Salut / Comment ça va"
+  - "Qu'est-ce que tu sais faire ?"
+  - "Tu t'appelles comment ?"
+  - "Merci / Au revoir"
+  - "Explique-moi quelque chose"
+  - "Quelle heure est-il ?" (réponse textuelle, pas d'action shell)
+  - "Raconte-moi une blague"
+  - Toute question générale sans action PC nécessaire
+  → assistant_reply = réponse naturelle et chaleureuse, steps = []
+
+MODE ACTION (mode="action", steps=[...]) :
+  Seulement quand l'utilisateur veut FAIRE quelque chose sur le PC :
+  - "Ouvre VS Code / Chrome / Notepad"
+  - "Crée un fichier sur le bureau"
+  - "Dis-moi l'IP de ma machine"
+  - "Installe requests"
+  - "Ferme l'application X"
+  - "Prends une capture d'écran"
+  → Construire les steps appropriés
+
+═══════════════ AGENTS DISPONIBLES ═══════════════
+
+• AgentFichiers  : gestion complète des fichiers (lire, créer, déplacer, copier,
+                   supprimer, compresser, extraire, hasher, diff)
+• AgentDev       : développement (git status/add/commit/push/pull, pip/npm install,
+                   run_python, linting, build, tests, run_script)
+• AgentReseau    : réseau (network_scan, ping_host, network_info, port_scan,
+                   liste des connexions actives, DNS lookup)
+• AgentSysteme   : système (system_info, list_processes, kill_process,
+                   env_get/set, performances CPU/RAM/disque en temps réel)
+• AgentAutomatisation : routines & automatisation (schedule, routine_add/list,
+                        run_script, boucles, macros, batch)
+• AgentWeb       : web (open_url, web_search si disponible, scraping basique)
+• AgentClipboard : presse-papier (clipboard_read, clipboard_write)
+• AgentNotifications : notifications système (notify_toast, historique notifs)
+• AgentPlanificateur : tâches planifiées (schedule, schedule_list, schedule_cancel)
+• AgentSecurite  : sécurité (hash_file, audit_log, détection anomalies,
+                   scan ports ouverts, liste processus suspects)
+
+═══════════════ KINDS D'ACTIONS ═══════════════
+
+Fichiers :
+  read_file / create_text_file / delete_file / move_file / copy_file
+  list_dir / search_files / search_file_content
+  zip_files / extract_zip / hash_file / diff_files
+
+Développement :
+  run_shell / run_python / run_script
+  git / git_status / git_commit / git_push / git_pull
+  install_package / uninstall_package / list_packages
+
+Réseau :
+  network_scan / network_info / ping_host / port_scan
+
+Système :
+  system_info / list_processes / kill_process
+  env_get / env_set / context
+
+Automatisation :
+  schedule / schedule_list / schedule_cancel
+  routine_add / routine_list / routine_delete
+
+Interface :
+  open_app / open_url / open_path / play_media
+  clipboard_read / clipboard_write
+  notify / notify_toast
+  capture_screen / take_screenshot / analyze_screen
+  speak_text
+
+Base de données :
+  db_query (interroger la base ASSISTA directement)
+  db_pcmap_search (rechercher dans la cartographie PC)
+  db_stats (statistiques de la base)
+
+═══════════════ RÈGLES DE RÉPONSE ═══════════════
+
+Format OBLIGATOIRE — JSON uniquement :
+{{
+  "mode": "chat" | "action",
+  "assistant_reply": "réponse naturelle française, directe et utile",
+  "agent": "AgentFichiers | AgentDev | AgentReseau | ... (agent principal utilisé)",
+  "remember": ["fait à mémoriser (optionnel)"],
+  "steps": [
+    {{
+      "kind": "<kind>",
+      "title": "description lisible",
+      "target": "CHEMIN ABSOLU COMPLET / URL / nom app / host",
+      "command": "commande complète si kind=run_shell/run_python/git",
+      "summary": "résumé de l'étape",
+      "risk": "safe | moderate | dangerous",
+      "meta": {{"content": "contenu du fichier si create_text_file"}}
+    }}
+  ]
+}}
+
+Exemples de mapping CRITIQUES :
+  "crée un fichier test.txt sur mon bureau"
+    → kind=create_text_file
+    → target="{Path.home() / "Desktop" / "test.txt"}"
+    → meta={{"content": "Contenu du fichier"}}
+
+  "ouvre VS Code"               → kind=open_app, target="vscode"
+  "donne-moi l'IP locale"       → kind=network_info, risk=safe
+  "prends une capture d'écran"  → kind=capture_screen, risk=safe
+  "installe requests"           → kind=install_package, target="pip:requests"
+  "git commit message X"        → kind=git_commit, command="git commit -m 'X'"
+  "bonjour / merci / blague"    → mode=chat, steps=[]
+
+Niveaux de risque :
+  safe      → lecture, observation, clipboard, notification, capture, ouvrir → direct
+  moderate  → création, modification, installation → logué, confirme si pas autopilot
+  dangerous → suppression, réseau actif, kill process → TOUJOURS confirmer
+
+Règles absolues :
+  - mode=chat + steps=[] pour les réponses conversationnelles pures
+  - Ne JAMAIS utiliser run_shell quand un kind dédié existe
+  - Pour install_package: target format = "pip:nom" ou "npm:nom" ou "choco:nom"
+  - Pour git: command = commande git complète avec arguments
+  - Indiquer l'agent utilisé dans "agent"
+  - Si la requête implique la cartographie PC → kind=db_pcmap_search
+  - Chemins Windows avec double-backslash dans les commandes shell
+  - TOUJOURS chemins ABSOLUS dans "target" pour les fichiers
+"""
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  COUCHE 4 — LLM
+# ══════════════════════════════════════════════════════════════════════════════
+class AssistaLLM:
+    try:
+        from nexus_core.aria_engine import answer_question as _aria_answer
+        _USE_ARIA_ENGINE = True
+    except Exception:
+        _aria_answer      = None
+        _USE_ARIA_ENGINE  = False
+
+    def __init__(self, config: AssistaConfig) -> None:
+        self._config = config
+
+    def _headers_and_url(self, stream: bool) -> Tuple[Dict, str, str]:
+        cfg     = self._config.load()
+        api_key = (cfg.get("api_key", "") or "").strip() \
+                  or os.getenv("OPENROUTER_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError(
+                "Aucune clé API configurée. "
+                "Ouvrez ⚙ Config dans ASSISTA et entrez votre clé OpenRouter, "
+                "ou définissez la variable d'environnement OPENROUTER_API_KEY."
+            )
+        model    = (cfg.get("model", DEFAULT_MODEL) or DEFAULT_MODEL).strip()
+        # Mode auto : on commence par le premier modèle de la liste
+        if not model or model == "__auto__":
+            model = FALLBACK_MODELS[0]
+        base_url = (cfg.get("base_url", DEFAULT_BASE_URL) or DEFAULT_BASE_URL).strip()
+        headers  = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type":  "application/json",
+            "HTTP-Referer":  "http://localhost",
+            "X-Title":       "ASSISTA v2",
+        }
+        if stream:
+            headers["Accept"] = "text/event-stream"
+        return headers, base_url, model
+
+    def _sse_stream(self, messages: List[Dict], on_token: Optional[Callable] = None) -> str:
+        headers, base_url, first_model = self._headers_and_url(stream=True)
+        cfg         = self._config.load()
+        saved_model = (cfg.get("model", DEFAULT_MODEL) or DEFAULT_MODEL).strip()
+        # Mode auto → rotation complète ; mode manuel → un seul modèle, pas de fallback
+        if saved_model in ("__auto__", "", DEFAULT_MODEL):
+            models_to_try = FALLBACK_MODELS
+        else:
+            models_to_try = [saved_model]
+        last_error = None
+        for mdl in models_to_try:
+            body   = json.dumps({"model": mdl, "stream": True, "messages": messages}).encode()
+            parsed = urllib.parse.urlparse(base_url)
+            conn   = http.client.HTTPSConnection(
+                parsed.netloc, context=ssl.create_default_context(), timeout=60
+            )
+            try:
+                conn.request("POST", parsed.path, body=body, headers=headers)
+                resp = conn.getresponse()
+            except Exception as e:
+                conn.close(); last_error = str(e); continue
+            if resp.status in (429, 404, 410):
+                resp.read(); conn.close()
+                last_error = f"HTTP {resp.status} sur {mdl}"; continue
+            if resp.status != 200:
+                resp.read(); conn.close()
+                last_error = f"HTTP {resp.status} sur {mdl}"; continue
+            chunks: List[str] = []
+            buf = b""
+            try:
+                while True:
+                    packet = resp.read(512)
+                    if not packet:
+                        break
+                    buf += packet
+                    while b"\n" in buf:
+                        line_b, buf = buf.split(b"\n", 1)
+                        line = line_b.decode("utf-8", errors="replace").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            token = (
+                                json.loads(data).get("choices", [{}])[0]
+                                .get("delta", {}).get("content", "")
+                            )
+                            if token:
+                                chunks.append(token)
+                                if on_token:
+                                    on_token(token)
+                        except json.JSONDecodeError:
+                            continue
+            finally:
+                conn.close()
+            result = "".join(chunks).strip()
+            if result:
+                return result
+            last_error = f"Réponse vide de {mdl}"
+        raise RuntimeError(f"Tous les modèles ont échoué : {last_error}")
+
+    def stream_chat(self, messages: List[Dict], on_token: Optional[Callable] = None) -> str:
+        if self.__class__._USE_ARIA_ENGINE and self.__class__._aria_answer is not None:
+            system_content = ""
+            history: List[Dict] = []
+            prompt = ""
+            for msg in messages:
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                if role == "system":
+                    system_content = content
+                elif role == "user":
+                    history.append({"role": "user", "content": content})
+                    prompt = content
+                elif role == "assistant":
+                    history.append({"role": "assistant", "content": content})
+            if history and history[-1]["role"] == "user":
+                history = history[:-1]
+            full_prompt = (
+                f"[INSTRUCTIONS SYSTÈME — PRIORITÉ ABSOLUE]\n{system_content}\n\n"
+                f"[DEMANDE UTILISATEUR]\n{prompt}"
+            ) if system_content else prompt
+            chunks: List[str] = []
+            def collect(t):
+                chunks.append(t)
+                if on_token:
+                    on_token(t)
+            try:
+                result = self.__class__._aria_answer(
+                    full_prompt, "admin",
+                    stream_callback=collect, history=history, theme="",
+                )
+                text = result[0] if isinstance(result, tuple) else str(result)
+                return "".join(chunks).strip() or text.strip()
+            except Exception as e:
+                print(f"[AssistaLLM] aria_engine échoué ({e}), fallback SSE")
+                return self._sse_stream(messages, on_token=on_token)
+        return self._sse_stream(messages, on_token=on_token)
+
+    def complete_json(self, messages: List[Dict]) -> Dict:
+        chunks: List[str] = []
+        def collect(t): chunks.append(t)
+        cfg = self._config.load()
+        api_key = (cfg.get("api_key", "") or "").strip() or os.getenv("OPENROUTER_API_KEY", "").strip()
+        if not api_key:
+            return self._local_planner(messages, RuntimeError("Aucune cle API configuree."))
+        try:
+            result = self.stream_chat(messages, on_token=collect)
+            return self._extract_json(result)
+        except Exception as e:
+            return self._local_planner(messages, e)
+
+    def _local_planner(self, messages: List[Dict], error: Exception = None) -> Dict:
+        """Secours sans API: garde ASSISTA utilisable pour chat et actions PC courantes."""
+        prompt = ""
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                try:
+                    data = json.loads(content)
+                    prompt = data.get("prompt", content)
+                except Exception:
+                    prompt = content
+                break
+        raw = (prompt or "").strip()
+        low = normalize_text(raw)
+
+        def chat(reply: str) -> Dict:
+            if error:
+                reply += "\n\n_Mode local actif : la connexion/API n'est pas disponible, donc je reponds avec mes outils integres._"
+            return {"mode": "chat", "assistant_reply": reply, "agent": "AgentLocal", "remember": [], "steps": []}
+
+        if not raw:
+            return chat("Je n'ai pas recu de demande exploitable.")
+        if any(x in low for x in ["bonjour", "salut", "hello", "coucou"]):
+            return chat("Bonjour ! Je suis prete. Je peux discuter, ouvrir des applications, lire le PC, chercher des fichiers, donner l'etat systeme/reseau et apprendre des exemples via ASSISTA_MODEL.")
+        if any(x in low for x in ["que sais", "tu peux", "capacite", "fonction"]):
+            return chat("Je peux agir avec mes agents fichiers, systeme, reseau, developpement, clipboard, notifications, planification, securite et cartographie PC. Pour les actions sensibles, je demande validation.")
+
+        app_map = {
+            "bloc note": "notepad", "bloc-notes": "notepad", "notepad": "notepad",
+            "calculatrice": "calculator", "calc": "calculator", "chrome": "chrome",
+            "edge": "edge", "explorer": "explorer", "fichiers": "explorer",
+            "vscode": "vscode", "vs code": "vscode",
+        }
+        if low.startswith("ouvre ") or low.startswith("lance "):
+            for name, target in app_map.items():
+                if name in low:
+                    return {"mode": "action", "assistant_reply": f"Je vais ouvrir {name}.", "agent": "AgentSysteme", "remember": [], "steps": [{"kind": "open_app", "title": f"Ouvrir {name}", "target": target, "summary": f"Lancement de {name}", "risk": "safe", "meta": {}}]}
+        if "ip" in low or "reseau" in low or "réseau" in low:
+            return {"mode": "action", "assistant_reply": "Je vais lire les informations reseau locales.", "agent": "AgentReseau", "remember": [], "steps": [{"kind": "network_info", "title": "Informations reseau", "summary": "Adresse IP et interfaces", "risk": "safe", "meta": {}}]}
+        if "capture" in low and ("ecran" in low or "écran" in low):
+            return {"mode": "action", "assistant_reply": "Je vais prendre une capture d'ecran.", "agent": "AgentSysteme", "remember": [], "steps": [{"kind": "capture_screen", "title": "Capture d'ecran", "summary": "Capture du bureau", "risk": "safe", "meta": {}}]}
+        if "stat" in low and ("db" in low or "base" in low or "assista" in low):
+            return {"mode": "action", "assistant_reply": "Je vais afficher les statistiques ASSISTA.", "agent": "AgentSecurite", "remember": [], "steps": [{"kind": "db_stats", "title": "Statistiques ASSISTA", "summary": "Etat de la base ASSISTA", "risk": "safe", "meta": {}}]}
+        if "process" in low or "processus" in low:
+            return {"mode": "action", "assistant_reply": "Je vais lister les processus actifs.", "agent": "AgentSysteme", "remember": [], "steps": [{"kind": "list_processes", "title": "Lister les processus", "summary": "Processus actifs", "risk": "safe", "meta": {}}]}
+
+        return chat("Je suis en mode local et je peux deja traiter les demandes courantes. Pour les demandes complexes en langage naturel, ajoutez une cle OpenRouter dans Config afin d'activer la planification LLM complete.")
+
+    def _extract_json(self, text: str) -> Dict:
+        cleaned = text
+        if "```" in cleaned:
+            m = re.search(r"```(?:json)?\s*([\s\S]+?)```", cleaned)
+            if m:
+                cleaned = m.group(1).strip()
+        brace = cleaned.find("{")
+        if brace != -1:
+            cleaned = cleaned[brace:]
+            depth = 0
+            for i, ch in enumerate(cleaned):
+                if ch == "{": depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        cleaned = cleaned[:i + 1]; break
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError as e:
+                raise RuntimeError(f"JSON LLM invalide : {e} | extrait={truncate(text, 300)}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  COUCHE 5 — SHELL EXECUTOR
+# ══════════════════════════════════════════════════════════════════════════════
+class AssistaShell:
+    BLACKLIST = [
+        r"\brm\s+-rf\s+/",
+        r"\bformat\s+[a-zA-Z]:",
+        r"\bdel\s+/[fqs].*\\\*",
+        r"Remove-Item.*-Recurse.*-Force.*[Cc]:\\",
+        r":\(\)\{\s*:\|:&\s*\};:",
+        r"\bshutdown\b.*(/s|--poweroff)",
+        r"\brd\s+/s\s+/q\s+[a-zA-Z]:",
+        r"Invoke-Expression.*\(New-Object.*DownloadString",
+        r"powershell.*-enc\s+[A-Za-z0-9+/=]{40,}",
+    ]
+    SENSITIVE_KEYWORDS = [
+        "delete", "remove", "erase", "format", "drop",
+        "rm ", "del ", "rmdir", "rd ", "mv ", "move ",
+        "shutdown", "restart", "reboot", "halt",
+        "net user", "net localgroup", "reg delete",
+        "cipher", "bcdedit", "diskpart",
+    ]
+
+    def __init__(self, db: AssistaDatabaseV2) -> None:
+        self._is_windows = platform.system() == "Windows"
+        self._db         = db
+
+    def classify(self, command: str) -> Dict:
+        cmd_lower = command.lower().strip()
+        for pattern in self.BLACKLIST:
+            if re.search(pattern, command, re.IGNORECASE):
+                return {"allowed": False, "risk": "blocked",
+                        "reason": f"Commande refusée (blacklist) : {pattern}"}
+        for kw in self.SENSITIVE_KEYWORDS:
+            if kw in cmd_lower:
+                return {"allowed": True, "risk": "dangerous",
+                        "reason": f"Commande sensible : '{kw}'"}
+        write_patterns = [
+            r"\bNew-Item\b", r"\bSet-Content\b", r"\bOut-File\b",
+            r"\bcopy\b", r"\bxcopy\b", r"\brobocopy\b",
+            r"\bmkdir\b", r"\bmd\b", r"\btouch\b", r"\bcp\b",
+            r"\bwrite\b", r"\becho.*>", r"\bpip\s+install\b",
+            r"\bnpm\s+install\b", r"\bgit\b",
+        ]
+        for p in write_patterns:
+            if re.search(p, command, re.IGNORECASE):
+                return {"allowed": True, "risk": "moderate",
+                        "reason": "Commande d'écriture ou d'installation"}
+        return {"allowed": True, "risk": "safe", "reason": "Commande de lecture/observation"}
+
+    def run(self, command: str, timeout: int = MAX_SHELL_TIMEOUT, cwd: Optional[str] = None) -> Dict:
+        check = self.classify(command)
+        if not check["allowed"]:
+            self._db.audit_add(command, "BLOCKED", check["reason"])
+            return {"ok": False, "stdout": "", "stderr": check["reason"],
+                    "returncode": -1, "message": f"🚫 {check['reason']}"}
+        shell_cmd = (
+            ["powershell.exe", "-NonInteractive", "-Command", command]
+            if self._is_windows else ["bash", "-c", command]
+        )
+        kwargs = dict(
+            capture_output=True, text=True, timeout=timeout,
+            cwd=cwd, encoding="utf-8", errors="replace"
+        )
+        if self._is_windows:
+            kwargs["creationflags"] = 0x08000000
+        try:
+            result = subprocess.run(shell_cmd, **kwargs)
+            stdout = truncate(result.stdout or "", MAX_FILE_CHARS)
+            stderr = truncate(result.stderr or "", 2000)
+            ok     = result.returncode == 0
+            self._db.audit_add(command, "OK" if ok else "ERROR", f"rc={result.returncode}")
+            output = stdout or stderr or "Commande exécutée sans sortie."
+            return {
+                "ok": ok, "stdout": stdout, "stderr": stderr,
+                "returncode": result.returncode,
+                "message": (f"✅ Exécuté\n```\n{output}\n```" if ok
+                            else f"⚠️ Erreur (code {result.returncode})\n```\n{output}\n```"),
+            }
+        except subprocess.TimeoutExpired:
+            self._db.audit_add(command, "TIMEOUT", f">{timeout}s")
+            return {"ok": False, "stdout": "", "stderr": f"Timeout ({timeout}s)",
+                    "returncode": -2, "message": f"⚠️ Timeout ({timeout}s)."}
+        except Exception as exc:
+            self._db.audit_add(command, "EXCEPTION", str(exc))
+            return {"ok": False, "stdout": "", "stderr": str(exc),
+                    "returncode": -3, "message": f"⚠️ Erreur : {exc}"}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  COUCHE 6 — MÉMOIRE (maintenant backed par SQLite)
+# ══════════════════════════════════════════════════════════════════════════════
+class AssistaMemory:
+    def __init__(self, db: AssistaDatabaseV2):
+        self._db = db
+
+    def add_fact(self, fact: str, source: str = "auto") -> None:
+        self._db.fact_add(fact, source)
+
+    def get_facts(self, n: int = 50) -> List[str]:
+        return self._db.fact_list(n)
+
+    def forget_all(self) -> None:
+        self._db.fact_clear()
+
+    def remember_turn(self, conv_id: str, user_text: str, assistant_text: str) -> None:
+        self._db.history_add(conv_id, "user", truncate(user_text, 1000))
+        self._db.history_add(conv_id, "assista", truncate(assistant_text, 2000))
+
+    def get_recent_turns(self, conv_id: str, n: int = 10) -> List[Dict]:
+        return self._db.history_get(conv_id, n)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  COUCHE 2 — CONTEXTE BUREAU
+# ══════════════════════════════════════════════════════════════════════════════
+class AssistaDesktopContext:
+    def __init__(self) -> None:
+        self.home                = Path.home()
+        self.last_capture_path:  Optional[Path] = None
+        self.last_ocr_text       = ""
+
+    def snapshot(self) -> Dict:
+        roots = [
+            ("Desktop",   self.home / "Desktop"),
+            ("Documents", self.home / "Documents"),
+            ("Downloads", self.home / "Downloads"),
+            ("Pictures",  self.home / "Pictures"),
+            ("Music",     self.home / "Music"),
+            ("Project",   PROJECT_ROOT),
+        ]
+        return {
+            "timestamp":     now_iso(),
+            "os":            platform.system(),
+            "os_version":    platform.version(),
+            "hostname":      socket.gethostname(),
+            "active_window": get_active_window_title(),
+            "home":          str(self.home),
+            "roots":         [
+                {"label": l, "path": str(p), "exists": "yes" if p.exists() else "no"}
+                for l, p in roots
+            ],
+            "recent_capture": str(self.last_capture_path) if self.last_capture_path else "",
+            "recent_ocr":    truncate(self.last_ocr_text, 300),
+            "capabilities": {
+                "screen_capture": ImageGrab is not None,
+                "ocr":            pytesseract is not None and bool(TESSERACT_PATH),
+                "tts":            pyttsx3 is not None,
+                "stt":            sr is not None,
+                "clipboard":      pyperclip is not None,
+                "psutil":         psutil is not None,
+                "pdf_read":       PdfReader is not None,
+                "word_read":      DocxDocument is not None,
+                "excel_read":     openpyxl is not None,
+            },
+        }
+
+    def capture_screen(self) -> Dict:
+        if ImageGrab is None:
+            return {"ok": False, "message": "Pillow manquant."}
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path  = CAPTURE_DIR / f"assista_{stamp}.png"
+        try:
+            img = ImageGrab.grab(all_screens=True)
+            img.save(path)
+            self.last_capture_path = path
+            return {"ok": True, "message": f"Capture enregistrée : {path}", "path": str(path)}
+        except Exception as e:
+            return {"ok": False, "message": f"Échec capture : {e}"}
+
+    def analyze_screen(self) -> Dict:
+        cap = self.capture_screen()
+        if not cap.get("ok"):
+            return cap
+        if pytesseract is None or not TESSERACT_PATH:
+            return {"ok": True, "message": f"Capture : {cap['path']}\nOCR indisponible.", "path": cap["path"]}
+        try:
+            img = ImageGrab.grab(all_screens=True)
+            self.last_ocr_text = pytesseract.image_to_string(img, lang="eng+fra").strip()
+            return {
+                "ok": True, "path": cap["path"],
+                "message": f"Capture : {cap['path']}\nTexte OCR :\n{truncate(self.last_ocr_text, 4000)}",
+                "ocr": self.last_ocr_text,
+            }
+        except Exception as e:
+            return {"ok": False, "message": f"Échec OCR : {e}"}
+
+    # ── Contrôle clavier / souris (Windows) ───────────────────────────────
+    def screen_preview_data_uri(self, max_width: int = 960) -> Dict:
+        """Capture l'écran et retourne un data URI JPEG (pour l'UI)."""
+        if ImageGrab is None:
+            return {"ok": False, "message": "Pillow manquant."}
+        try:
+            img = ImageGrab.grab(all_screens=True)
+            if max_width and img.width > max_width:
+                ratio = max_width / float(img.width)
+                img = img.resize((int(img.width * ratio), int(img.height * ratio)))
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=72)
+            data = base64.b64encode(buf.getvalue()).decode("ascii")
+            return {"ok": True, "data_uri": f"data:image/jpeg;base64,{data}",
+                    "width": img.width, "height": img.height}
+        except Exception as e:
+            return {"ok": False, "message": f"Échec aperçu : {e}"}
+
+    def click_at(self, x: int, y: int) -> Dict:
+        """Déplace et clique la souris à (x, y) — Windows uniquement."""
+        if platform.system() != "Windows":
+            return {"ok": False, "message": "Contrôle souris Windows uniquement."}
+        try:
+            u32 = ctypes.windll.user32
+            u32.SetCursorPos(int(x), int(y))
+            u32.mouse_event(0x0002, 0, 0, 0, 0)
+            u32.mouse_event(0x0004, 0, 0, 0, 0)
+            return {"ok": True, "message": f"Clic en ({x}, {y})."}
+        except Exception as e:
+            return {"ok": False, "message": f"Échec clic : {e}"}
+
+    def click_text(self, text: str) -> Dict:
+        """Cherche le texte à l'écran via OCR et clique dessus."""
+        query = normalize_text(text)
+        if not query:
+            return {"ok": False, "message": "Texte vide."}
+        if ImageGrab is None or pytesseract is None or not TESSERACT_PATH:
+            return {"ok": False, "message": "Clic OCR indisponible (Pillow/Tesseract manquant)."}
+        try:
+            img  = ImageGrab.grab(all_screens=True)
+            data = pytesseract.image_to_data(img, lang="eng+fra",
+                                             output_type=pytesseract.Output.DICT)
+            words = []
+            for i, raw in enumerate(data.get("text", [])):
+                w = normalize_text(raw)
+                if w:
+                    words.append((w, data["left"][i], data["top"][i],
+                                  data["width"][i], data["height"][i]))
+            q_parts = query.split()
+            for i in range(len(words)):
+                candidate = " ".join(w[0] for w in words[i:i+len(q_parts)])
+                if query in candidate:
+                    chunk  = words[i:i+len(q_parts)]
+                    cx = (min(w[1] for w in chunk) + max(w[1]+w[3] for w in chunk)) // 2
+                    cy = (min(w[2] for w in chunk) + max(w[2]+w[4] for w in chunk)) // 2
+                    return self.click_at(cx, cy)
+            return {"ok": False, "message": f"Texte non trouvé : {text}"}
+        except Exception as e:
+            return {"ok": False, "message": f"Erreur OCR clic : {e}"}
+
+    def type_text(self, text: str) -> Dict:
+        """Tape du texte via le presse-papiers + Ctrl+V."""
+        if not text:
+            return {"ok": False, "message": "Texte vide."}
+        if platform.system() != "Windows":
+            return {"ok": False, "message": "Saisie automatique Windows uniquement."}
+        if write_clipboard_text(text):
+            self.hotkey(["ctrl", "v"])
+            return {"ok": True, "message": f"Texte saisi ({len(text)} caractères)."}
+        return {"ok": False, "message": "Impossible d'écrire dans le presse-papiers."}
+
+    def press_key(self, key: str) -> Dict:
+        """Appuie sur une touche (par nom)."""
+        vk = _vk_key(key)
+        if not vk:
+            return {"ok": False, "message": f"Touche inconnue : {key}"}
+        _send_vk(vk, True)
+        time.sleep(0.03)
+        _send_vk(vk, False)
+        return {"ok": True, "message": f"Touche : {key}"}
+
+    def hotkey(self, keys: List[str]) -> Dict:
+        """Envoie un raccourci clavier (ex: ['ctrl','c'])."""
+        vks = [_vk_key(k) for k in keys if _vk_key(k)]
+        if not vks:
+            return {"ok": False, "message": "Raccourci vide ou inconnu."}
+        for vk in vks:
+            _send_vk(vk, True)
+            time.sleep(0.02)
+        for vk in reversed(vks):
+            _send_vk(vk, False)
+            time.sleep(0.02)
+        return {"ok": True, "message": "Raccourci : " + "+".join(keys)}
+
+    def control_window(self, action: str) -> Dict:
+        """Minimise, maximise, restaure ou ferme la fenêtre active."""
+        if platform.system() != "Windows":
+            return {"ok": False, "message": "Contrôle fenêtres Windows uniquement."}
+        hwnd = _get_foreground_hwnd()
+        if not hwnd:
+            return {"ok": False, "message": "Aucune fenêtre active."}
+        a = normalize_text(action)
+        cmds = {"minimize":6,"minimise":6,"reduis":6,"maximize":3,"agrandis":3,
+                "restore":9,"restaure":9,"normal":9}
+        try:
+            if a in {"close","ferme","fermer"}:
+                ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)
+            else:
+                ctypes.windll.user32.ShowWindow(hwnd, cmds.get(a, 9))
+            return {"ok": True, "message": f"Fenêtre : {action}"}
+        except Exception as e:
+            return {"ok": False, "message": f"Erreur fenêtre : {e}"}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  10 AGENTS SPÉCIALISÉS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AgentBase:
+    """Base commune pour tous les agents."""
+    name = "AgentBase"
+
+    def __init__(self, shell: AssistaShell, db: AssistaDatabaseV2, ctx: AssistaDesktopContext):
+        self._shell = shell
+        self._db    = db
+        self._ctx   = ctx
+
+    def execute(self, proposal: "ActionProposal") -> Dict:
+        raise NotImplementedError
+
+
+class AgentFichiers(AgentBase):
+    """Gestion complète des fichiers."""
+    name = "AgentFichiers"
+
+    def execute(self, p: "ActionProposal") -> Dict:
+        k = p.kind
+        if k in ("read_file",):             return self._read_file(p)
+        if k in ("create_text_file", "write_file"): return self._create_file(p)
+        if k == "delete_file":              return self._delete_file(p)
+        if k in ("move_file",):             return self._move_file(p)
+        if k == "copy_file":                return self._copy_file(p)
+        if k in ("list_dir",):              return self._list_dir(p)
+        if k in ("search_files",):          return self._search_files(p)
+        if k == "search_file_content":      return self._search_content(p)
+        if k == "zip_files":                return self._zip_files(p)
+        if k == "extract_zip":              return self._extract_zip(p)
+        if k == "hash_file":                return self._hash_file(p)
+        if k == "diff_files":               return self._diff_files(p)
+        return {"ok": False, "message": f"Kind inconnu pour AgentFichiers : {k}"}
+
+    def _list_dir(self, p: "ActionProposal") -> Dict:
+        aliases = {
+            "bureau": str(self._ctx.home / "Desktop"),
+            "desktop": str(self._ctx.home / "Desktop"),
+            "documents": str(self._ctx.home / "Documents"),
+            "downloads": str(self._ctx.home / "Downloads"),
+            "téléchargements": str(self._ctx.home / "Downloads"),
+            "telechargements": str(self._ctx.home / "Downloads"),
+            "pictures": str(self._ctx.home / "Pictures"),
+            "images": str(self._ctx.home / "Pictures"),
+            "musique": str(self._ctx.home / "Music"),
+            "music": str(self._ctx.home / "Music"),
+            "videos": str(self._ctx.home / "Videos"),
+            "project": str(PROJECT_ROOT),
+        }
+        target = p.target.strip()
+        path   = Path(aliases.get(target.lower(), target))
+        if not path.exists():
+            return {"ok": False, "message": f"Dossier introuvable : {path}"}
+        try:
+            items = sorted(path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+            lines = [f"📁 {path}\n"]
+            for item in items[:100]:
+                icon = "📁" if item.is_dir() else "📄"
+                size = ""
+                if item.is_file():
+                    try: size = f" ({human_size(item.stat().st_size)})"
+                    except Exception: pass
+                lines.append(f"{icon} {item.name}{size}")
+            total = sum(1 for _ in path.iterdir())
+            if total > 100:
+                lines.append(f"… {total} éléments au total")
+            return {"ok": True, "message": "\n".join(lines)}
+        except PermissionError:
+            return {"ok": False, "message": f"Accès refusé : {path}"}
+
+    def _read_file(self, p: "ActionProposal") -> Dict:
+        path = Path(p.target.strip())
+        if not path.exists():
+            return {"ok": False, "message": f"Fichier introuvable : {path}"}
+        ext = path.suffix.lower()
+        if ext == ".pdf":
+            if PdfReader is None:
+                return {"ok": False, "message": "pypdf non installé"}
+            try:
+                reader = PdfReader(str(path))
+                text   = "\n".join(pg.extract_text() or "" for pg in reader.pages)
+                return {"ok": True, "message": f"📄 {path.name}\n\n{truncate(text, MAX_FILE_CHARS)}"}
+            except Exception as e:
+                return {"ok": False, "message": f"Erreur PDF : {e}"}
+        if ext == ".docx":
+            if DocxDocument is None:
+                return {"ok": False, "message": "python-docx non installé"}
+            try:
+                doc  = DocxDocument(str(path))
+                text = "\n".join(pg.text for pg in doc.paragraphs)
+                return {"ok": True, "message": f"📄 {path.name}\n\n{truncate(text, MAX_FILE_CHARS)}"}
+            except Exception as e:
+                return {"ok": False, "message": f"Erreur DOCX : {e}"}
+        if ext in {".xlsx", ".xlsm"}:
+            if openpyxl is None:
+                return {"ok": False, "message": "openpyxl non installé"}
+            try:
+                wb    = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+                lines = []
+                for ws in wb.worksheets[:3]:
+                    lines.append(f"=== {ws.title} ===")
+                    for row in ws.iter_rows(max_row=50, values_only=True):
+                        lines.append("\t".join(str(c) if c is not None else "" for c in row))
+                return {"ok": True, "message": f"📊 {path.name}\n\n{truncate(chr(10).join(lines), MAX_FILE_CHARS)}"}
+            except Exception as e:
+                return {"ok": False, "message": f"Erreur Excel : {e}"}
+        if ext in TEXT_EXTENSIONS or ext == "":
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+                return {"ok": True, "message": f"📄 {path.name}\n\n{truncate(text, MAX_FILE_CHARS)}"}
+            except Exception as e:
+                return {"ok": False, "message": f"Erreur lecture : {e}"}
+        return {"ok": False, "message": f"Type non supporté : {ext}"}
+
+    def _create_file(self, p: "ActionProposal") -> Dict:
+        raw_target = p.target.strip()
+        content = str(p.meta.get("content", "")).strip()
+        # ── Résolution des alias de dossiers courants ──
+        home = self._ctx.home
+        folder_aliases = {
+            "bureau":          str(home / "Desktop"),
+            "desktop":         str(home / "Desktop"),
+            "documents":       str(home / "Documents"),
+            "downloads":       str(home / "Downloads"),
+            "téléchargements": str(home / "Downloads"),
+            "telechargements": str(home / "Downloads"),
+            "images":          str(home / "Pictures"),
+            "pictures":        str(home / "Pictures"),
+            "musique":         str(home / "Music"),
+            "music":           str(home / "Music"),
+            "videos":          str(home / "Videos"),
+            "vidéos":          str(home / "Videos"),
+        }
+        # Résolution des chemins relatifs commençant par un alias
+        resolved_target = raw_target
+        lower_target = raw_target.lower().replace("\\", "/")
+        for alias, real_path in folder_aliases.items():
+            if lower_target.startswith(alias + "/") or lower_target == alias:
+                resolved_target = raw_target.replace(raw_target.split("/")[0], real_path, 1)
+                break
+            # Cas: "bureau\fichier.txt" (Windows)
+            if lower_target.startswith(alias + "\\"):
+                resolved_target = real_path + "\\" + raw_target.split("\\", 1)[1]
+                break
+        # Si le chemin est juste un nom de fichier sans dossier, le mettre sur le bureau
+        path = Path(resolved_target)
+        if not path.is_absolute() and "/" not in resolved_target and "\\" not in resolved_target:
+            # Nom de fichier seul → on le place sur le bureau par défaut
+            path = home / "Desktop" / path.name
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+            return {"ok": True, "message": f"✅ Fichier créé : {path}"}
+        except Exception as e:
+            return {"ok": False, "message": f"Échec : {e}"}
+
+    def _delete_file(self, p: "ActionProposal") -> Dict:
+        path = Path(p.target.strip())
+        if not path.exists():
+            return {"ok": False, "message": f"Introuvable : {path}"}
+        try:
+            if path.is_dir():
+                shutil.rmtree(str(path))
+            else:
+                path.unlink()
+            return {"ok": True, "message": f"🗑️ Supprimé : {path}"}
+        except Exception as e:
+            return {"ok": False, "message": f"Erreur : {e}"}
+
+    def _move_file(self, p: "ActionProposal") -> Dict:
+        src = Path(p.target.strip())
+        dst = Path(str(p.meta.get("destination", "")).strip())
+        if not src.exists():
+            return {"ok": False, "message": f"Source introuvable : {src}"}
+        try:
+            src.rename(dst)
+            return {"ok": True, "message": f"📦 Déplacé : {src} → {dst}"}
+        except Exception as e:
+            return {"ok": False, "message": f"Erreur : {e}"}
+
+    def _copy_file(self, p: "ActionProposal") -> Dict:
+        src = Path(p.target.strip())
+        dst = Path(str(p.meta.get("destination", "")).strip())
+        if not src.exists():
+            return {"ok": False, "message": f"Source introuvable : {src}"}
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if src.is_dir(): shutil.copytree(str(src), str(dst))
+            else:            shutil.copy2(str(src), str(dst))
+            return {"ok": True, "message": f"📋 Copié : {src} → {dst}"}
+        except Exception as e:
+            return {"ok": False, "message": f"Erreur : {e}"}
+
+    def _search_files(self, p: "ActionProposal") -> Dict:
+        root  = Path(p.target or str(self._ctx.home))
+        query = normalize_text(p.meta.get("query", p.target))
+        # Chercher d'abord dans la DB
+        db_results = self._db.pcmap_search(query, limit=MAX_SEARCH_RESULTS)
+        if db_results:
+            lines = [f"🔍 Résultats DB ({len(db_results)}) :"]
+            for r in db_results:
+                lines.append(f"  {'📁' if r['type']=='dir' else '📄'} {r['path']}")
+            return {"ok": True, "message": "\n".join(lines)}
+        # Fallback scan live
+        if not root.exists():
+            return {"ok": False, "message": f"Dossier introuvable : {root}"}
+        matches = []
+        try:
+            for item in root.rglob("*"):
+                if query in normalize_text(item.name):
+                    matches.append(str(item))
+                    if len(matches) >= MAX_SEARCH_RESULTS:
+                        break
+        except Exception as e:
+            return {"ok": False, "message": f"Erreur : {e}"}
+        if not matches:
+            return {"ok": True, "message": f"Aucun fichier pour '{query}'"}
+        return {"ok": True, "message": "\n".join(matches)}
+
+    def _search_content(self, p: "ActionProposal") -> Dict:
+        root  = Path(p.target or str(self._ctx.home))
+        query = normalize_text(p.meta.get("query", p.target))
+        if not root.exists():
+            return {"ok": False, "message": f"Dossier introuvable : {root}"}
+        results = []
+        try:
+            for fpath in root.rglob("*"):
+                if not fpath.is_file() or fpath.suffix.lower() not in TEXT_EXTENSIONS:
+                    continue
+                try:
+                    content = fpath.read_text(encoding="utf-8", errors="ignore")
+                    if query in normalize_text(content):
+                        for i, line in enumerate(content.splitlines()):
+                            if query in normalize_text(line):
+                                results.append(f"{fpath}:{i+1}: {line.strip()[:120]}")
+                                break
+                        if len(results) >= MAX_SEARCH_RESULTS:
+                            break
+                except Exception:
+                    continue
+        except Exception as e:
+            return {"ok": False, "message": f"Erreur : {e}"}
+        if not results:
+            return {"ok": True, "message": f"Aucun contenu pour '{query}'"}
+        return {"ok": True, "message": "\n".join(results)}
+
+    def _zip_files(self, p: "ActionProposal") -> Dict:
+        sources = p.meta.get("sources", [p.target])
+        dest    = p.meta.get("destination", str(Path(p.target).with_suffix(".zip")))
+        try:
+            with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zf:
+                for src in sources:
+                    src_path = Path(src)
+                    if src_path.is_dir():
+                        for f in src_path.rglob("*"):
+                            if f.is_file():
+                                zf.write(f, f.relative_to(src_path.parent))
+                    elif src_path.is_file():
+                        zf.write(src_path, src_path.name)
+            return {"ok": True, "message": f"📦 ZIP créé : {dest}"}
+        except Exception as e:
+            return {"ok": False, "message": f"Erreur ZIP : {e}"}
+
+    def _extract_zip(self, p: "ActionProposal") -> Dict:
+        src  = Path(p.target.strip())
+        dest = Path(p.meta.get("destination", str(src.parent / src.stem)))
+        if not src.exists():
+            return {"ok": False, "message": f"Archive introuvable : {src}"}
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(str(src), "r") as zf:
+                zf.extractall(str(dest))
+            return {"ok": True, "message": f"📂 Extrait dans : {dest}"}
+        except Exception as e:
+            return {"ok": False, "message": f"Erreur extraction : {e}"}
+
+    def _hash_file(self, p: "ActionProposal") -> Dict:
+        path = Path(p.target.strip())
+        algo = p.meta.get("algo", "sha256").lower()
+        if not path.exists():
+            return {"ok": False, "message": f"Fichier introuvable : {path}"}
+        try:
+            h = hashlib.new(algo)
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    h.update(chunk)
+            digest = h.hexdigest()
+            return {"ok": True, "message": f"🔒 {algo.upper()} de `{path.name}` :\n`{digest}`"}
+        except Exception as e:
+            return {"ok": False, "message": f"Erreur hash : {e}"}
+
+    def _diff_files(self, p: "ActionProposal") -> Dict:
+        import difflib
+        src  = Path(p.target.strip())
+        dest = Path(str(p.meta.get("destination", "")).strip())
+        if not src.exists():
+            return {"ok": False, "message": f"Fichier A introuvable : {src}"}
+        if not dest.exists():
+            return {"ok": False, "message": f"Fichier B introuvable : {dest}"}
+        try:
+            a = src.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+            b = dest.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+            diff = list(difflib.unified_diff(a, b, fromfile=src.name, tofile=dest.name, n=3))
+            if not diff:
+                return {"ok": True, "message": "✅ Les fichiers sont identiques."}
+            return {"ok": True, "message": "```diff\n" + truncate("".join(diff), 4000) + "\n```"}
+        except Exception as e:
+            return {"ok": False, "message": f"Erreur diff : {e}"}
+
+
+class AgentDev(AgentBase):
+    """Développement : git, pip/npm, run_python, scripts."""
+    name = "AgentDev"
+
+    def execute(self, p: "ActionProposal") -> Dict:
+        k = p.kind
+        if k == "run_python":       return self._run_python(p)
+        if k == "run_script":       return self._run_script(p)
+        if k in ("git", "git_status", "git_commit", "git_push", "git_pull"):
+            return self._git(p)
+        if k == "install_package":   return self._install_package(p)
+        if k == "uninstall_package": return self._uninstall_package(p)
+        if k == "list_packages":     return self._list_packages(p)
+        return {"ok": False, "message": f"Kind inconnu pour AgentDev : {k}"}
+
+    def _run_python(self, p: "ActionProposal") -> Dict:
+        code = (p.command or p.meta.get("code", "")).strip()
+        if not code:
+            return {"ok": False, "message": "Code Python vide."}
+        # Exécute dans un sous-process Python
+        script = SCRIPTS_DIR / f"tmp_{uuid.uuid4().hex[:8]}.py"
+        try:
+            script.write_text(code, encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(script)],
+                capture_output=True, text=True, timeout=30,
+                encoding="utf-8", errors="replace"
+            )
+            out = (result.stdout or "") + (result.stderr or "")
+            ok  = result.returncode == 0
+            return {
+                "ok": ok,
+                "message": f"{'✅' if ok else '⚠️'} Python :\n```\n{truncate(out, 3000)}\n```"
+            }
+        except Exception as e:
+            return {"ok": False, "message": f"Erreur run_python : {e}"}
+        finally:
+            try: script.unlink()
+            except Exception: pass
+
+    def _run_script(self, p: "ActionProposal") -> Dict:
+        path = Path(p.target.strip())
+        if not path.exists():
+            return {"ok": False, "message": f"Script introuvable : {path}"}
+        ext = path.suffix.lower()
+        if ext == ".py":
+            cmd = f'"{sys.executable}" "{path}"'
+        elif ext in (".sh",):
+            cmd = f'bash "{path}"'
+        elif ext in (".bat", ".cmd"):
+            cmd = f'"{path}"'
+        elif ext == ".ps1":
+            cmd = f'powershell -File "{path}"'
+        else:
+            cmd = f'"{path}"'
+        return self._shell.run(cmd)
+
+    def _git(self, p: "ActionProposal") -> Dict:
+        k   = p.kind
+        cmd = (p.command or "").strip()
+        cwd = p.meta.get("cwd") or str(PROJECT_ROOT)
+        if not cmd:
+            if k == "git_status":  cmd = "git status"
+            elif k == "git_push":  cmd = "git push"
+            elif k == "git_pull":  cmd = "git pull"
+            elif k == "git_commit":
+                msg = p.meta.get("message", "update")
+                cmd = f'git add -A && git commit -m "{msg}"'
+            else:
+                cmd = f"git {p.target or 'status'}"
+        return self._shell.run(cmd, cwd=cwd)
+
+    def _install_package(self, p: "ActionProposal") -> Dict:
+        target = (p.target or "").strip()
+        # Format: "pip:requests" ou "npm:lodash" ou juste "requests"
+        if ":" in target:
+            manager, pkg = target.split(":", 1)
+        else:
+            manager, pkg = "pip", target
+        manager = manager.lower().strip()
+        pkg     = pkg.strip()
+        if not pkg:
+            return {"ok": False, "message": "Nom du package manquant."}
+        if manager == "pip":
+            cmd = f'"{sys.executable}" -m pip install {pkg}'
+        elif manager == "npm":
+            cmd = f"npm install -g {pkg}"
+        elif manager in ("choco", "chocolatey"):
+            cmd = f"choco install {pkg} -y"
+        elif manager == "winget":
+            cmd = f"winget install {pkg}"
+        else:
+            cmd = f'"{sys.executable}" -m pip install {pkg}'
+        result = self._shell.run(cmd)
+        if result["ok"]:
+            self._db.packages_update([{"name": pkg, "version": "", "manager": manager}])
+        return result
+
+    def _uninstall_package(self, p: "ActionProposal") -> Dict:
+        target = (p.target or "").strip()
+        if ":" in target:
+            manager, pkg = target.split(":", 1)
+        else:
+            manager, pkg = "pip", target
+        if manager == "pip":
+            cmd = f'"{sys.executable}" -m pip uninstall -y {pkg}'
+        elif manager == "npm":
+            cmd = f"npm uninstall -g {pkg}"
+        else:
+            cmd = f'"{sys.executable}" -m pip uninstall -y {pkg}'
+        return self._shell.run(cmd)
+
+    def _list_packages(self, p: "ActionProposal") -> Dict:
+        manager = (p.target or p.meta.get("manager", "")).strip().lower() or None
+        pkgs    = self._db.packages_list(manager)
+        if not pkgs:
+            return {"ok": True, "message": "Aucun package trouvé dans la base. Lancez un scan PC."}
+        lines = [f"📦 Packages ({manager or 'tous'}) — {len(pkgs)} entrées :"]
+        for pkg in pkgs[:50]:
+            lines.append(f"  [{pkg['manager']}] {pkg['name']} {pkg['version']}")
+        if len(pkgs) > 50:
+            lines.append(f"  … et {len(pkgs)-50} autres")
+        return {"ok": True, "message": "\n".join(lines)}
+
+
+class AgentReseau(AgentBase):
+    """Réseau : scan, ping, info, ports."""
+    name = "AgentReseau"
+
+    def execute(self, p: "ActionProposal") -> Dict:
+        k = p.kind
+        if k == "network_info":  return self._network_info(p)
+        if k == "ping_host":     return self._ping(p)
+        if k == "network_scan":  return self._network_scan(p)
+        if k == "port_scan":     return self._port_scan(p)
+        return {"ok": False, "message": f"Kind inconnu pour AgentReseau : {k}"}
+
+    def _network_info(self, p: "ActionProposal") -> Dict:
+        lines = ["🌐 **Informations réseau :**\n"]
+        # IP locale
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("8.8.8.8", 80))
+                local_ip = s.getsockname()[0]
+            lines.append(f"• IP locale : `{local_ip}`")
+        except Exception:
+            lines.append("• IP locale : non disponible")
+        # Hostname
+        lines.append(f"• Hostname : `{socket.gethostname()}`")
+        # Interfaces
+        if psutil:
+            try:
+                addrs = psutil.net_if_addrs()
+                for iface, addr_list in addrs.items():
+                    for addr in addr_list:
+                        if addr.family == socket.AF_INET:
+                            lines.append(f"• {iface} : `{addr.address}`")
+            except Exception:
+                pass
+        return {"ok": True, "message": "\n".join(lines)}
+
+    def _ping(self, p: "ActionProposal") -> Dict:
+        host = (p.target or "8.8.8.8").strip()
+        try:
+            start = time.time()
+            socket.setdefaulttimeout(3)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect((host, 80))
+            ms = (time.time() - start) * 1000
+            self._db.netscan_add(host, 80, "open", ms)
+            return {"ok": True, "message": f"🏓 Ping `{host}` : {ms:.1f} ms (port 80 ouvert)"}
+        except Exception:
+            # ICMP fallback
+            cmd = (f"ping -n 1 -w 1000 {host}" if platform.system() == "Windows"
+                   else f"ping -c 1 -W 1 {host}")
+            result = self._shell.run(cmd)
+            self._db.netscan_add(host, None, "ping", None)
+            return result
+
+    def _network_scan(self, p: "ActionProposal") -> Dict:
+        """Scan du réseau local (plage /24)."""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("8.8.8.8", 80))
+                local_ip = s.getsockname()[0]
+            base = ".".join(local_ip.split(".")[:3])
+        except Exception:
+            return {"ok": False, "message": "Impossible de déterminer le réseau local."}
+
+        found  = []
+        lock   = threading.Lock()
+
+        def probe(i):
+            host = f"{base}.{i}"
+            try:
+                socket.setdefaulttimeout(0.5)
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.connect((host, 80))
+                with lock:
+                    found.append(host)
+                self._db.netscan_add(host, 80, "open", None)
+            except Exception:
+                pass
+
+        threads = [threading.Thread(target=probe, args=(i,), daemon=True) for i in range(1, 255)]
+        for t in threads: t.start()
+        for t in threads: t.join(timeout=2)
+
+        if not found:
+            return {"ok": True, "message": f"🔍 Scan {base}.1-254 : aucun hôte actif trouvé."}
+        lines = [f"🔍 Hôtes actifs sur {base}.0/24 ({len(found)}) :"]
+        for h in sorted(found):
+            lines.append(f"  • {h}")
+        return {"ok": True, "message": "\n".join(lines)}
+
+    def _port_scan(self, p: "ActionProposal") -> Dict:
+        host  = (p.target or "localhost").strip()
+        ports = p.meta.get("ports", [21, 22, 23, 25, 53, 80, 110, 143, 443, 3306, 5432, 8080, 8443, 3389])
+        open_ports = []
+        for port in ports:
+            try:
+                socket.setdefaulttimeout(0.5)
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.connect((host, int(port)))
+                open_ports.append(port)
+                self._db.netscan_add(host, port, "open", None)
+            except Exception:
+                self._db.netscan_add(host, port, "closed", None)
+        if not open_ports:
+            return {"ok": True, "message": f"🔒 Aucun port ouvert sur `{host}` parmi {ports}"}
+        lines = [f"🔓 Ports ouverts sur `{host}` :"]
+        for port in open_ports:
+            lines.append(f"  • Port {port}")
+        return {"ok": True, "message": "\n".join(lines)}
+
+
+class AgentSysteme(AgentBase):
+    """Système : infos, processus, env."""
+    name = "AgentSysteme"
+
+    def execute(self, p: "ActionProposal") -> Dict:
+        k = p.kind
+        if k == "system_info":    return self._system_info(p)
+        if k == "list_processes": return self._list_processes(p)
+        if k == "kill_process":   return self._kill_process(p)
+        if k == "env_get":        return self._env_get(p)
+        if k == "env_set":        return self._env_set(p)
+        if k == "context":        return self._context(p)
+        return {"ok": False, "message": f"Kind inconnu pour AgentSysteme : {k}"}
+
+    def _system_info(self, p: "ActionProposal") -> Dict:
+        lines = ["🖥️ **Informations système :**\n"]
+        lines.append(f"• OS : {platform.system()} {platform.version()}")
+        lines.append(f"• Machine : {platform.machine()} — {platform.processor()}")
+        if psutil:
+            try:
+                cpu_pct  = psutil.cpu_percent(interval=0.5)
+                ram      = psutil.virtual_memory()
+                disk     = psutil.disk_usage("/")
+                lines.append(f"• CPU : {cpu_pct}% ({psutil.cpu_count()} cœurs)")
+                lines.append(f"• RAM : {human_size(ram.used)} / {human_size(ram.total)} ({ram.percent}%)")
+                lines.append(f"• Disque : {human_size(disk.used)} / {human_size(disk.total)} ({disk.percent}%)")
+                boot = datetime.fromtimestamp(psutil.boot_time()).strftime("%Y-%m-%d %H:%M")
+                lines.append(f"• Démarré : {boot}")
+            except Exception as e:
+                lines.append(f"• psutil error : {e}")
+        else:
+            cmd = (
+                "Get-CimInstance Win32_OperatingSystem | Select-Object Caption,FreePhysicalMemory,TotalVisibleMemorySize | Out-String; "
+                "Get-PSDrive C | Select-Object Used,Free | Out-String"
+                if platform.system() == "Windows"
+                else "uname -a; free -h; df -h /"
+            )
+            return self._shell.run(cmd)
+        return {"ok": True, "message": "\n".join(lines)}
+
+    def _list_processes(self, p: "ActionProposal") -> Dict:
+        if psutil:
+            try:
+                procs = []
+                for proc in psutil.process_iter(["pid", "name", "cpu_percent", "memory_info"]):
+                    try:
+                        procs.append(proc.info)
+                    except Exception:
+                        pass
+                procs.sort(key=lambda x: x.get("cpu_percent") or 0, reverse=True)
+                lines = ["⚙️ **Top 20 processus (CPU) :**\n"]
+                for pr in procs[:20]:
+                    mem = human_size(pr.get("memory_info") and pr["memory_info"].rss or 0)
+                    lines.append(f"  [{pr['pid']:5}] {(pr['name'] or '?')[:30]:30} CPU:{pr.get('cpu_percent',0):.1f}% MEM:{mem}")
+                return {"ok": True, "message": "\n".join(lines)}
+            except Exception:
+                pass
+        cmd = ("Get-Process | Sort-Object CPU -Descending | Select-Object -First 20 Name,Id,CPU,WorkingSet | Format-Table -AutoSize | Out-String"
+               if platform.system() == "Windows" else "ps aux --sort=-%cpu | head -22")
+        return self._shell.run(cmd)
+
+    def _kill_process(self, p: "ActionProposal") -> Dict:
+        name = (p.target or p.meta.get("name", "")).strip()
+        if not name:
+            return {"ok": False, "message": "Nom de processus manquant."}
+        if psutil:
+            killed = []
+            for proc in psutil.process_iter(["pid", "name"]):
+                try:
+                    if normalize_text(name) in normalize_text(proc.info.get("name") or ""):
+                        proc.kill()
+                        killed.append(str(proc.info["pid"]))
+                except Exception:
+                    pass
+            if killed:
+                return {"ok": True, "message": f"✅ Processus tués : {', '.join(killed)}"}
+        cmd = (f"Stop-Process -Name '{name}' -Force"
+               if platform.system() == "Windows" else f"pkill -f '{name}'")
+        return self._shell.run(cmd)
+
+    def _env_get(self, p: "ActionProposal") -> Dict:
+        key = (p.target or "").strip()
+        if key:
+            val = os.environ.get(key, "")
+            return {"ok": True, "message": f"🔑 {key} = `{val}`" if val else f"Variable `{key}` non définie."}
+        # Liste toutes les variables
+        lines = ["🔑 **Variables d'environnement :**\n"]
+        for k, v in sorted(os.environ.items())[:50]:
+            lines.append(f"  {k} = {truncate(v, 80)}")
+        return {"ok": True, "message": "\n".join(lines)}
+
+    def _env_set(self, p: "ActionProposal") -> Dict:
+        key = (p.target or "").strip()
+        val = str(p.meta.get("value", "")).strip()
+        if not key:
+            return {"ok": False, "message": "Clé de variable manquante."}
+        os.environ[key] = val
+        return {"ok": True, "message": f"✅ {key} = `{val}` (session courante)"}
+
+    def _context(self, p: "ActionProposal") -> Dict:
+        snap = self._ctx.snapshot()
+        return {"ok": True, "message": json.dumps(snap, ensure_ascii=False, indent=2)}
+
+
+class AgentAutomatisation(AgentBase):
+    """Automatisation : routines, scripts batch."""
+    name = "AgentAutomatisation"
+
+    def execute(self, p: "ActionProposal") -> Dict:
+        k = p.kind
+        if k == "routine_add":    return self._routine_add(p)
+        if k == "routine_list":   return self._routine_list(p)
+        if k == "routine_delete": return self._routine_delete(p)
+        return {"ok": False, "message": f"Kind inconnu pour AgentAutomatisation : {k}"}
+
+    def _routine_add(self, p: "ActionProposal") -> Dict:
+        label      = p.title or p.target
+        trigger_kw = str(p.meta.get("trigger_kw", label))
+        steps      = p.meta.get("steps", [])
+        if not steps:
+            return {"ok": False, "message": "Aucune étape définie pour la routine."}
+        rid = self._db.routine_add(label, trigger_kw, steps)
+        return {"ok": True, "message": f"✅ Routine créée : `{label}` (déclencheur : '{trigger_kw}')"}
+
+    def _routine_list(self, p: "ActionProposal") -> Dict:
+        routines = self._db.routine_list()
+        if not routines:
+            return {"ok": True, "message": "Aucune routine enregistrée."}
+        lines = [f"🔄 **Routines ({len(routines)}) :**\n"]
+        for r in routines:
+            lines.append(f"  • **{r['label']}** — déclencheur : `{r['trigger_kw']}` ({len(r['steps'])} étapes)")
+        return {"ok": True, "message": "\n".join(lines)}
+
+    def _routine_delete(self, p: "ActionProposal") -> Dict:
+        rid = (p.target or p.meta.get("id", "")).strip()
+        if not rid:
+            return {"ok": False, "message": "ID de routine manquant."}
+        self._db.routine_delete(rid)
+        return {"ok": True, "message": f"🗑️ Routine supprimée."}
+
+
+class AgentWeb(AgentBase):
+    """Web : ouvrir URLs."""
+    name = "AgentWeb"
+
+    def execute(self, p: "ActionProposal") -> Dict:
+        k = p.kind
+        if k == "open_url": return self._open_url(p)
+        return {"ok": False, "message": f"Kind inconnu pour AgentWeb : {k}"}
+
+    def _open_url(self, p: "ActionProposal") -> Dict:
+        url = p.target.strip()
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        try:
+            webbrowser.open(url)
+            return {"ok": True, "message": f"🌐 Ouverture de {url}"}
+        except Exception as e:
+            return {"ok": False, "message": f"Erreur : {e}"}
+
+
+class AgentClipboard(AgentBase):
+    """Presse-papier."""
+    name = "AgentClipboard"
+
+    def execute(self, p: "ActionProposal") -> Dict:
+        k = p.kind
+        if k == "clipboard_read":  return self._read(p)
+        if k == "clipboard_write": return self._write(p)
+        return {"ok": False, "message": f"Kind inconnu pour AgentClipboard : {k}"}
+
+    def _read(self, p: "ActionProposal") -> Dict:
+        if pyperclip is None:
+            return {"ok": False, "message": "pyperclip non installé (pip install pyperclip)"}
+        try:
+            text = pyperclip.paste()
+            return {"ok": True, "message": f"📋 Presse-papier :\n```\n{truncate(text, 2000)}\n```"}
+        except Exception as e:
+            return {"ok": False, "message": f"Erreur lecture clipboard : {e}"}
+
+    def _write(self, p: "ActionProposal") -> Dict:
+        if pyperclip is None:
+            return {"ok": False, "message": "pyperclip non installé (pip install pyperclip)"}
+        text = (p.command or p.target or str(p.meta.get("content", ""))).strip()
+        try:
+            pyperclip.copy(text)
+            return {"ok": True, "message": f"📋 Copié dans le presse-papier : `{truncate(text, 80)}`"}
+        except Exception as e:
+            return {"ok": False, "message": f"Erreur écriture clipboard : {e}"}
+
+
+class AgentNotifications(AgentBase):
+    """Notifications système."""
+    name = "AgentNotifications"
+
+    def execute(self, p: "ActionProposal") -> Dict:
+        k = p.kind
+        if k in ("notify", "notify_toast"): return self._notify(p)
+        return {"ok": False, "message": f"Kind inconnu pour AgentNotifications : {k}"}
+
+    def _notify(self, p: "ActionProposal") -> Dict:
+        title = p.title or "ASSISTA"
+        body  = (p.command or p.target or p.summary or "").strip()
+        self._db.notif_add(title, body, "toast")
+        # Tentative notification native
+        sent = False
+        if platform.system() == "Windows":
+            try:
+                from win10toast import ToastNotifier  # type: ignore
+                ToastNotifier().show_toast(title, body, duration=5, threaded=True)
+                sent = True
+            except Exception:
+                pass
+            if not sent:
+                # Fallback PowerShell
+                cmd = (
+                    f'Add-Type -AssemblyName System.Windows.Forms; '
+                    f'$n = New-Object System.Windows.Forms.NotifyIcon; '
+                    f'$n.Icon = [System.Drawing.SystemIcons]::Information; '
+                    f'$n.BalloonTipTitle = "{title}"; '
+                    f'$n.BalloonTipText = "{body}"; '
+                    f'$n.Visible = $true; '
+                    f'$n.ShowBalloonTip(3000)'
+                )
+                self._shell.run(cmd)
+                sent = True
+        elif platform.system() == "Darwin":
+            try:
+                subprocess.run(
+                    ["osascript", "-e", f'display notification "{body}" with title "{title}"'],
+                    check=True, capture_output=True
+                )
+                sent = True
+            except Exception:
+                pass
+        else:
+            try:
+                subprocess.run(["notify-send", title, body], check=True, capture_output=True)
+                sent = True
+            except Exception:
+                pass
+        return {"ok": True, "message": f"🔔 Notification envoyée : **{title}** — {body}"}
+
+
+class AgentPlanificateur(AgentBase):
+    """Planification de tâches."""
+    name = "AgentPlanificateur"
+
+    def __init__(self, shell: AssistaShell, db: AssistaDatabaseV2,
+                 ctx: AssistaDesktopContext, brain_ref=None):
+        super().__init__(shell, db, ctx)
+        self._brain = brain_ref
+        self._timer_thread: Optional[threading.Thread] = None
+
+    def execute(self, p: "ActionProposal") -> Dict:
+        k = p.kind
+        if k == "schedule":         return self._schedule(p)
+        if k == "schedule_list":    return self._list(p)
+        if k == "schedule_cancel":  return self._cancel(p)
+        return {"ok": False, "message": f"Kind inconnu pour AgentPlanificateur : {k}"}
+
+    def _schedule(self, p: "ActionProposal") -> Dict:
+        label      = p.title or p.target
+        command    = (p.command or p.target).strip()
+        interval_s = int(p.meta.get("interval_s", 0))
+        delay_s    = int(p.meta.get("delay_s", 0))
+        run_at_str = p.meta.get("run_at", "")
+
+        if delay_s > 0:
+            run_at = (datetime.now() + timedelta(seconds=delay_s)).strftime("%Y-%m-%d %H:%M:%S")
+        elif run_at_str:
+            run_at = run_at_str
+        else:
+            run_at = now_iso()
+
+        task = ScheduledTask(
+            id=str(uuid.uuid4()), label=label, command=command,
+            kind=p.meta.get("kind", "run_shell"),
+            run_at=run_at, interval_s=interval_s, next_run=run_at
+        )
+        self._db.task_add(task)
+        self._ensure_scheduler()
+        eta = f" dans {delay_s}s" if delay_s else f" à {run_at}"
+        rpt = f" (répétition toutes les {interval_s}s)" if interval_s else ""
+        return {"ok": True, "message": f"⏰ Tâche planifiée{eta}{rpt} : `{label}`"}
+
+    def _list(self, p: "ActionProposal") -> Dict:
+        tasks = self._db.task_list()
+        if not tasks:
+            return {"ok": True, "message": "Aucune tâche planifiée."}
+        lines = [f"⏰ **Tâches planifiées ({len(tasks)}) :**\n"]
+        for t in tasks:
+            lines.append(f"  • **{t['label']}** — prochaine : {t.get('next_run','?')}")
+        return {"ok": True, "message": "\n".join(lines)}
+
+    def _cancel(self, p: "ActionProposal") -> Dict:
+        tid = (p.target or p.meta.get("id", "")).strip()
+        if not tid:
+            return {"ok": False, "message": "ID de tâche manquant."}
+        self._db.task_delete(tid)
+        return {"ok": True, "message": f"✅ Tâche annulée."}
+
+    def _ensure_scheduler(self) -> None:
+        if self._timer_thread and self._timer_thread.is_alive():
+            return
+        self._timer_thread = threading.Thread(
+            target=self._scheduler_loop, daemon=True, name="Scheduler"
+        )
+        self._timer_thread.start()
+
+    def _scheduler_loop(self) -> None:
+        while True:
+            time.sleep(5)
+            try:
+                now = datetime.now()
+                for task in self._db.task_list():
+                    next_run = task.get("next_run")
+                    if not next_run:
+                        continue
+                    try:
+                        next_dt = datetime.strptime(next_run, "%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        continue
+                    if now >= next_dt:
+                        # Exécuter
+                        try:
+                            self._shell.run(task["command"])
+                        except Exception:
+                            pass
+                        last = now_iso()
+                        interval = task.get("interval_s", 0)
+                        if interval > 0:
+                            nxt = (now + timedelta(seconds=interval)).strftime("%Y-%m-%d %H:%M:%S")
+                        else:
+                            nxt = None
+                            self._db.task_delete(task["id"])
+                            continue
+                        self._db.task_update_run(task["id"], last, nxt)
+            except Exception:
+                pass
+
+
+class AgentSecurite(AgentBase):
+    """Sécurité : audit, hash, ports ouverts."""
+    name = "AgentSecurite"
+
+    def execute(self, p: "ActionProposal") -> Dict:
+        k = p.kind
+        if k == "hash_file":    return AgentFichiers(self._shell, self._db, self._ctx)._hash_file(p)
+        if k == "audit_log":    return self._audit_log(p)
+        if k == "security_scan": return self._security_scan(p)
+        return {"ok": False, "message": f"Kind inconnu pour AgentSecurite : {k}"}
+
+    def _audit_log(self, p: "ActionProposal") -> Dict:
+        n       = int(p.meta.get("n", 30))
+        entries = self._db.audit_get(n)
+        if not entries:
+            return {"ok": True, "message": "Journal d'audit vide."}
+        lines = [f"🔐 **Dernières {len(entries)} commandes auditées :**\n"]
+        for e in entries:
+            icon = "✅" if e["status"] == "OK" else ("🚫" if e["status"] == "BLOCKED" else "⚠️")
+            lines.append(f"  {icon} [{e['ts']}] {truncate(e['command'], 60)} — {e['status']}")
+        return {"ok": True, "message": "\n".join(lines)}
+
+    def _security_scan(self, p: "ActionProposal") -> Dict:
+        lines = ["🛡️ **Scan de sécurité :**\n"]
+        # Processus suspects (noms communs de malwares)
+        suspects = {"mimikatz", "netcat", "nc.exe", "nmap", "metasploit", "meterpreter"}
+        if psutil:
+            for proc in psutil.process_iter(["pid", "name"]):
+                try:
+                    name = (proc.info.get("name") or "").lower()
+                    if any(s in name for s in suspects):
+                        lines.append(f"  ⚠️ Processus suspect : `{proc.info['name']}` (PID {proc.info['pid']})")
+                except Exception:
+                    pass
+        # Ports ouverts locaux
+        if psutil:
+            try:
+                conns = psutil.net_connections()
+                listening = [c for c in conns if c.status == "LISTEN"]
+                lines.append(f"\n• Ports en écoute ({len(listening)}) :")
+                for c in listening[:20]:
+                    lines.append(f"  Port {c.laddr.port}")
+            except Exception:
+                pass
+        if len(lines) == 1:
+            lines.append("  ✅ Aucune anomalie détectée.")
+        return {"ok": True, "message": "\n".join(lines)}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  REGISTRY D'ACTIONS v2
+# ══════════════════════════════════════════════════════════════════════════════
+class AssistaActionRegistryV2:
+    """
+    Dispatch vers les 10 agents spécialisés.
+    Garde aussi les actions directes (open_app, play_media, speak_text, etc.)
+    """
+    # Mapping kind → agent
+    AGENT_MAP = {
+        # AgentFichiers
+        "read_file": "fichiers", "create_text_file": "fichiers", "write_file": "fichiers",
+        "delete_file": "fichiers", "move_file": "fichiers", "copy_file": "fichiers",
+        "list_dir": "fichiers", "search_files": "fichiers", "search_file_content": "fichiers",
+        "zip_files": "fichiers", "extract_zip": "fichiers",
+        "hash_file": "fichiers", "diff_files": "fichiers",
+        # AgentDev
+        "run_python": "dev", "run_script": "dev",
+        "git": "dev", "git_status": "dev", "git_commit": "dev", "git_push": "dev", "git_pull": "dev",
+        "install_package": "dev", "uninstall_package": "dev", "list_packages": "dev",
+        # AgentReseau
+        "network_info": "reseau", "ping_host": "reseau",
+        "network_scan": "reseau", "port_scan": "reseau",
+        # AgentSysteme
+        "system_info": "systeme", "list_processes": "systeme", "kill_process": "systeme",
+        "env_get": "systeme", "env_set": "systeme", "context": "systeme",
+        # AgentAutomatisation
+        "routine_add": "auto", "routine_list": "auto", "routine_delete": "auto",
+        # AgentWeb
+        "open_url": "web",
+        # AgentClipboard
+        "clipboard_read": "clipboard", "clipboard_write": "clipboard",
+        # AgentNotifications
+        "notify": "notifs", "notify_toast": "notifs",
+        # AgentPlanificateur
+        "schedule": "planif", "schedule_list": "planif", "schedule_cancel": "planif",
+        # AgentSecurite
+        "audit_log": "secu", "security_scan": "secu",
+    }
+
+    def __init__(self, shell: AssistaShell, db: AssistaDatabaseV2,
+                 ctx: AssistaDesktopContext, brain_ref=None):
+        self._shell = shell
+        self._db    = db
+        self._ctx   = ctx
+
+        self._agents = {
+            "fichiers":  AgentFichiers(shell, db, ctx),
+            "dev":       AgentDev(shell, db, ctx),
+            "reseau":    AgentReseau(shell, db, ctx),
+            "systeme":   AgentSysteme(shell, db, ctx),
+            "auto":      AgentAutomatisation(shell, db, ctx),
+            "web":       AgentWeb(shell, db, ctx),
+            "clipboard": AgentClipboard(shell, db, ctx),
+            "notifs":    AgentNotifications(shell, db, ctx),
+            "planif":    AgentPlanificateur(shell, db, ctx, brain_ref),
+            "secu":      AgentSecurite(shell, db, ctx),
+        }
+        # Actions directes (hors agents)
+        self._direct = {
+            "run_shell":       self._exec_shell,
+            "open_app":        self._exec_open_app,
+            "open_path":       self._exec_open_path,
+            "play_media":      self._exec_play_media,
+            "capture_screen":  self._exec_capture_screen,
+            "take_screenshot": self._exec_capture_screen,
+            "analyze_screen":  self._exec_analyze_screen,
+            "speak_text":      self._exec_speak_text,
+            # DB internals
+            "db_query":        self._exec_db_query,
+            "db_pcmap_search": self._exec_db_pcmap_search,
+            "db_stats":        self._exec_db_stats,
+        }
+
+    def execute(self, proposal: "ActionProposal") -> Dict:
+        # Direct d'abord
+        handler = self._direct.get(proposal.kind)
+        if handler:
+            try:
+                return handler(proposal)
+            except Exception as e:
+                return {"ok": False, "message": f"Erreur direct {proposal.kind} : {e}"}
+        # Puis agents
+        agent_key = self.AGENT_MAP.get(proposal.kind)
+        if agent_key:
+            agent = self._agents.get(agent_key)
+            if agent:
+                try:
+                    return agent.execute(proposal)
+                except Exception as e:
+                    return {"ok": False, "message": f"Erreur agent {agent.name} ({proposal.kind}) : {e}"}
+        return {"ok": False, "message": f"Action inconnue : {proposal.kind}"}
+
+    def get_agent(self, name: str) -> Optional[AgentBase]:
+        return self._agents.get(name)
+
+    # ── Actions directes ──────────────────────────────────────────────────────
+    def _exec_shell(self, p: "ActionProposal") -> Dict:
+        cmd = (p.command or p.target).strip()
+        if not cmd:
+            return {"ok": False, "message": "Commande vide."}
+        return self._shell.run(cmd)
+
+    def _exec_open_app(self, p: "ActionProposal") -> Dict:
+        name = p.target.strip()
+        exe  = APP_ALIASES.get(normalize_text(name), name)
+        try:
+            if exe.startswith("ms-"):
+                os.startfile(exe)
+            elif platform.system() == "Windows":
+                subprocess.Popen(
+                    exe, shell=True,
+                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL
+                )
+            else:
+                subprocess.Popen(exe, shell=True,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 stdin=subprocess.DEVNULL)
+            return {"ok": True, "message": f"🚀 Lancement de {name}"}
+        except Exception as e:
+            return {"ok": False, "message": f"Échec lancement {name} : {e}"}
+
+    def _exec_open_path(self, p: "ActionProposal") -> Dict:
+        path = Path(p.target.strip())
+        if not path.exists():
+            return {"ok": False, "message": f"Chemin introuvable : {path}"}
+        try:
+            if platform.system() == "Windows":
+                os.startfile(str(path))
+            elif platform.system() == "Darwin":
+                subprocess.Popen(["open", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                subprocess.Popen(["xdg-open", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return {"ok": True, "message": f"📂 Ouverture de {path}"}
+        except Exception as e:
+            return {"ok": False, "message": f"Erreur : {e}"}
+
+    def _exec_play_media(self, p: "ActionProposal") -> Dict:
+        AUDIO_EXTS = {".mp3", ".flac", ".ogg", ".wav", ".aac", ".m4a", ".wma", ".opus"}
+        VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".webm"}
+        MEDIA_EXTS = AUDIO_EXTS | VIDEO_EXTS
+        target = (p.target or p.command or "").strip().strip('"\'')
+        home   = Path.home()
+        music_aliases = {"musique", "music", "mes musiques", "dossier musique"}
+        if not target or target.lower() in music_aliases:
+            candidates = [home/"Music", home/"Musique", home/"Documents"/"Music"]
+            music_dir  = next((d for d in candidates if d.exists()), None)
+            if not music_dir:
+                return {"ok": False, "message": "❌ Dossier Musique introuvable."}
+            target = str(music_dir)
+        path = Path(target)
+        if path.is_dir():
+            found = []
+            for ext in AUDIO_EXTS:
+                found.extend(path.glob(f"*{ext}"))
+                found.extend(path.glob(f"**/*{ext}"))
+                if found:
+                    break
+            if not found:
+                return {"ok": False, "message": f"❌ Aucun fichier audio dans {path}"}
+            path = found[0]
+        if not path.exists():
+            return {"ok": False, "message": f"❌ Fichier introuvable : {path}"}
+        if path.suffix.lower() not in MEDIA_EXTS:
+            return {"ok": False, "message": f"❌ Format non supporté : {path.suffix}"}
+        try:
+            if platform.system() == "Windows":
+                os.startfile(str(path))
+            elif platform.system() == "Darwin":
+                subprocess.Popen(["open", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                subprocess.Popen(["xdg-open", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return {"ok": True, "message": f"🎵 Lecture : {path.name}"}
+        except Exception as e:
+            return {"ok": False, "message": f"❌ {e}"}
+
+    def _exec_capture_screen(self, p: "ActionProposal") -> Dict:
+        return self._ctx.capture_screen()
+
+    def _exec_analyze_screen(self, p: "ActionProposal") -> Dict:
+        return self._ctx.analyze_screen()
+
+    def _exec_speak_text(self, p: "ActionProposal") -> Dict:
+        text = (p.command or p.target or p.summary).strip()
+        return {"ok": True, "message": f"🔊 {text}", "_speak": text}
+
+    def _exec_db_query(self, p: "ActionProposal") -> Dict:
+        sql = (p.command or p.meta.get("sql", "")).strip()
+        if not sql:
+            return {"ok": False, "message": "Requête SQL manquante."}
+        # Whitelist : seulement SELECT
+        if not re.match(r"^\s*SELECT\b", sql, re.IGNORECASE):
+            return {"ok": False, "message": "Seules les requêtes SELECT sont autorisées via db_query."}
+        try:
+            rows = self._db.raw_query(sql)
+            if not rows:
+                return {"ok": True, "message": "Aucun résultat."}
+            lines = [f"📊 {len(rows)} résultat(s) :"]
+            for r in rows[:30]:
+                lines.append("  " + json.dumps(r, ensure_ascii=False))
+            return {"ok": True, "message": "\n".join(lines)}
+        except Exception as e:
+            return {"ok": False, "message": f"Erreur SQL : {e}"}
+
+    def _exec_db_pcmap_search(self, p: "ActionProposal") -> Dict:
+        query = (p.target or p.meta.get("query", "")).strip()
+        if not query:
+            return {"ok": False, "message": "Terme de recherche manquant."}
+        results = self._db.pcmap_search(query)
+        if not results:
+            return {"ok": True, "message": f"Aucun fichier trouvé pour '{query}' dans la cartographie PC."}
+        lines = [f"🗺️ Cartographie PC — '{query}' ({len(results)} résultats) :"]
+        for r in results:
+            icon = "📁" if r["type"] == "dir" else "📄"
+            lines.append(f"  {icon} {r['path']}")
+        return {"ok": True, "message": "\n".join(lines)}
+
+    def _exec_db_stats(self, p: "ActionProposal") -> Dict:
+        stats = self._db.pcmap_stats()
+        facts_count  = len(self._db.fact_list(9999))
+        audit_count  = len(self._db.audit_get(9999))
+        notif_count  = len(self._db.notif_list(9999))
+        task_count   = len(self._db.task_list())
+        lines = ["📊 **Statistiques ASSISTA DB :**\n"]
+        lines.append(f"• PC Map : {stats['total']} entrées ({stats['files']} fichiers, {stats['dirs']} dossiers)")
+        lines.append(f"• Mémoire : {facts_count} faits mémorisés")
+        lines.append(f"• Shell audit : {audit_count} commandes")
+        lines.append(f"• Notifications : {notif_count}")
+        lines.append(f"• Tâches planifiées : {task_count}")
+        if stats["top_extensions"]:
+            lines.append("\n• Extensions les plus fréquentes :")
+            for e in stats["top_extensions"]:
+                lines.append(f"  {e['ext'] or '(sans ext)'} : {e['cnt']}")
+        return {"ok": True, "message": "\n".join(lines)}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  POLITIQUE DE SÉCURITÉ v2
+# ══════════════════════════════════════════════════════════════════════════════
+class AssistaPermissionPolicyV2:
+    SAFE_KINDS = {
+        "context", "capture_screen", "analyze_screen", "take_screenshot",
+        "list_dir", "search_files", "search_file_content", "read_file",
+        "open_url", "open_path", "open_app", "speak_text", "play_media",
+        "list_processes", "system_info", "network_info", "ping_host",
+        "clipboard_read", "clipboard_write", "notify", "notify_toast",
+        "git_status", "list_packages", "db_query", "db_pcmap_search", "db_stats",
+        "env_get", "hash_file", "diff_files", "audit_log",
+        "schedule", "schedule_list", "schedule_cancel",
+        "routine_list", "port_scan", "security_scan",
+    }
+    MODERATE_KINDS = {
+        "create_text_file", "write_file", "copy_file", "move_file",
+        "zip_files", "extract_zip",
+        "git", "git_commit", "git_push", "git_pull",
+        "install_package", "uninstall_package",
+        "run_python", "run_script",
+        "clipboard_write", "env_set",
+        "routine_add", "routine_delete",
+    }
+    DANGEROUS_KINDS = {
+        "delete_file", "kill_process",
+        "network_scan", "run_shell",
+    }
+
+    def __init__(self) -> None:
+        pass
+
+    def review(self, proposal: "ActionProposal", autopilot: bool = False,
+               shell: Optional[AssistaShell] = None) -> "ActionProposal":
+        kind = proposal.kind
+
+        if kind in self.SAFE_KINDS:
+            proposal.risk = "safe"
+            proposal.requires_confirm = proposal.requires_approval = False
+            return proposal
+
+        if kind == "run_shell" and shell:
+            classification = shell.classify(proposal.command or proposal.target)
+            if not classification["allowed"]:
+                proposal.risk = "blocked"
+                proposal.requires_confirm = proposal.requires_approval = True
+                proposal.summary = f"🚫 BLOQUÉ : {classification['reason']}"
+                return proposal
+            risk = classification["risk"]
+            proposal.risk = risk
+            if risk == "dangerous":
+                proposal.requires_confirm = proposal.requires_approval = True
+            elif risk == "moderate":
+                proposal.requires_confirm = proposal.requires_approval = not autopilot
+            else:
+                proposal.requires_confirm = proposal.requires_approval = False
+            return proposal
+
+        if kind in self.MODERATE_KINDS:
+            proposal.risk = "moderate"
+            proposal.requires_confirm = proposal.requires_approval = not autopilot
+            return proposal
+
+        if kind in self.DANGEROUS_KINDS:
+            proposal.risk = "dangerous"
+            proposal.requires_confirm = proposal.requires_approval = True
+            return proposal
+
+        # Fallback
+        proposal.risk = "moderate"
+        proposal.requires_confirm = proposal.requires_approval = not autopilot
+        return proposal
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  COUCHE 7 — VOIX
+# ══════════════════════════════════════════════════════════════════════════════
+WAKE_WORDS  = {"salut", "bonjour", "hey assista", "assista", "réveille-toi", "reveille-toi"}
+SLEEP_WORDS = {"au revoir", "bonne nuit", "dors", "en veille", "stop assista"}
+
+class AssistaVoice:
+    """
+    Gestion TTS (pyttsx3) + STT (SpeechRecognition).
+
+    BUG CORRIGÉ — Relance TTS impossible :
+    pyttsx3 est mono-thread par design. Appeler engine.stop() puis engine.runAndWait()
+    dans un thread différent corrompt le moteur COM → il ne peut plus redémarrer.
+    Solution : on crée un moteur neuf à chaque appel speak(), dans son propre thread,
+    et on l'arrête via un Event threading plutôt que engine.stop().
+    """
+
+    def __init__(self, brain: "AssistaBrainV2") -> None:
+        self._brain        = brain
+        self._stop_fn      = None          # STT background listener
+        self._listening    = False
+        self._speaking     = False
+        self._awake        = False
+        self.auto_speak    = False
+        self.status        = "Voix non initialisée"
+        self._volume       = 0.0
+        self._lock         = threading.Lock()
+        # Contrôle du thread TTS actif
+        self._tts_stop_evt = threading.Event()
+        self._tts_thread:  Optional[threading.Thread] = None
+
+    # ── TTS ───────────────────────────────────────────────────────────────
+    def speak(self, text: str) -> Dict:
+        """Lance la lecture TTS dans un thread dédié avec moteur neuf."""
+        clean = prepare_tts_text(text)
+        if not clean:
+            return {"ok": True, "message": "Rien à prononcer."}
+        if pyttsx3 is None:
+            return {"ok": False, "message": "TTS indisponible (pip install pyttsx3)."}
+
+        # Stoppe toute lecture en cours avant de relire un autre message.
+        self._request_stop_tts(wait=1.2)
+
+        self._tts_stop_evt = threading.Event()
+        stop_evt = self._tts_stop_evt
+
+        def _run():
+            engine = None
+            try:
+                # Nouveau moteur à chaque fois → jamais de corruption COM
+                engine = pyttsx3.init()
+                engine.setProperty("rate", 175)
+                engine.setProperty("volume", 0.9)
+            except Exception as e:
+                with self._lock:
+                    self._speaking = False
+                    self.status    = "Prête"
+                return
+
+            with self._lock:
+                self._speaking = True
+                self.status    = "ASSISTA parle…"
+
+            try:
+                engine.say(clean)
+                # runAndWait en boucle courte pour répondre au stop_evt
+                engine.startLoop(False)
+                while not stop_evt.is_set():
+                    try:
+                        engine.iterate()
+                    except Exception:
+                        break
+                    # Vérifie si le moteur a fini naturellement
+                    if not engine.isBusy():
+                        break
+                engine.endLoop()
+            except AttributeError:
+                # Fallback : ancienne API pyttsx3 sans startLoop/iterate
+                if not stop_evt.is_set():
+                    try:
+                        engine.runAndWait()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            finally:
+                # Nettoyage moteur dans son propre thread (obligatoire)
+                try:
+                    engine.stop()
+                except Exception:
+                    pass
+                with self._lock:
+                    self._speaking = False
+                    self.status    = "Prête"
+
+        self._tts_thread = threading.Thread(target=_run, daemon=True, name="ASSISTA-TTS")
+        self._tts_thread.start()
+        return {"ok": True, "message": f"🔊 {truncate(clean, 60)}"}
+
+    def _request_stop_tts(self, wait: float = 0.8) -> None:
+        """Signale au thread TTS actif de s'arreter et evite les lectures superposees."""
+        if self._tts_stop_evt is not None:
+            self._tts_stop_evt.set()
+        if self._tts_thread and self._tts_thread.is_alive():
+            self._tts_thread.join(timeout=wait)
+        with self._lock:
+            self._speaking = False
+
+    def stop_speaking(self) -> Dict:
+        """Arrête immédiatement la lecture TTS en cours. Relançable ensuite."""
+        self._request_stop_tts(wait=1.2)
+        with self._lock:
+            self.status = "Prête"
+        return {"ok": True, "message": "🔇 Lecture arrêtée."}
+
+    # ── STT ───────────────────────────────────────────────────────────────
+    def start_listening(self) -> Dict:
+        if sr is None:
+            return {"ok": False, "message": "SpeechRecognition manquant (pip install SpeechRecognition)."}
+        if self._listening:
+            return {"ok": True, "message": "Déjà en écoute."}
+
+        mic_index  = choose_microphone_index()
+        recognizer = sr.Recognizer()
+        recognizer.dynamic_energy_threshold = True
+        recognizer.pause_threshold = 1.0
+
+        def _callback(recognizer, audio):
+            try:
+                text  = recognizer.recognize_google(audio, language="fr-FR").strip()
+                if not text:
+                    return
+                lower = normalize_text(text)
+                with self._lock:
+                    awake = self._awake
+                    hf    = getattr(self._brain, "hands_free", False)
+                if any(w in lower for w in WAKE_WORDS) and not awake:
+                    with self._lock:
+                        self._awake = True
+                    self._brain.mark_wake_event(text)
+                    self.speak("Bonjour, je vous écoute.")
+                    return
+                if any(w in lower for w in SLEEP_WORDS) and awake:
+                    with self._lock:
+                        self._awake = False
+                    self._brain.mark_sleep_event(text)
+                    self.speak("Je repasse en veille. À bientôt.")
+                    return
+                if awake or hf:
+                    self._brain.submit(text, source="voice")
+            except sr.UnknownValueError:
+                pass
+            except Exception:
+                pass
+
+        try:
+            mic = sr.Microphone(device_index=mic_index)
+            self._stop_fn = recognizer.listen_in_background(
+                mic, _callback, phrase_time_limit=10
+            )
+            with self._lock:
+                self._listening = True
+                # En mains libres, on se réveille directement
+                if getattr(self._brain, "hands_free", False):
+                    self._awake = True
+                self.status = "Micro actif — en écoute"
+            return {"ok": True, "message": "🎙 Micro activé. Dites 'salut' pour me réveiller."}
+        except Exception as e:
+            return {"ok": False, "message": f"Échec activation micro : {e}"}
+
+    def stop_listening(self) -> Dict:
+        if self._stop_fn:
+            try:
+                self._stop_fn(wait_for_stop=False)
+            except Exception:
+                pass
+            self._stop_fn = None
+        with self._lock:
+            self._listening = False
+            self.status     = "Micro désactivé"
+        return {"ok": True, "message": "🔇 Micro désactivé."}
+
+    def toggle_auto_speak(self, enabled: bool) -> Dict:
+        self.auto_speak = bool(enabled)
+        msg = "Auto-lecture activée." if self.auto_speak else "Auto-lecture désactivée."
+        return {"ok": True, "message": msg}
+
+    def get_state(self) -> Dict:
+        with self._lock:
+            return {
+                "listening": self._listening,
+                "speaking":  self._speaking,
+                "awake":     self._awake,
+                "status":    self.status,
+                "volume":    self._volume,
+            }
+
+    def refresh_idle(self) -> None:
+        with self._lock:
+            if not self._listening and not self._speaking:
+                self.status = "Micro désactivé" if not self._awake else "Prête"
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CERVEAU PRINCIPAL V2 — AssistaBrainV2
+# ══════════════════════════════════════════════════════════════════════════════
+class AssistaBrainV2:
+    """
+    Cerveau ASSISTA v2 — orchestration complète.
+
+    API publique (compatible pywebview) :
+      bootstrap()
+      submit(prompt, source)
+      approve_plan(id) / reject_plan(id)
+      set_autopilot(bool)
+      start_voice() / stop_voice() / set_auto_speak(bool)
+      speak_last_response()
+      get_state()
+      get_config() / save_config(...)
+      get_shell_log(n)
+      forget_memory()
+      get_memory()
+      get_db_stats()
+      scan_pc(full)
+      get_pcmap_stats()
+      poll_js()
+      analyze_local_path(path_str)
+    """
+
+    def __init__(self, user_name: str) -> None:
+        self.user_name = user_name or "Utilisateur"
+        self._lock     = threading.RLock()
+
+        # Couches
+        self.db       = AssistaDatabaseV2()
+        self.config   = AssistaConfig(self.db)
+        self.memory   = AssistaMemory(self.db)
+        self.context  = AssistaDesktopContext()
+        self.shell    = AssistaShell(self.db)
+        self.policy   = AssistaPermissionPolicyV2()
+        self.registry = AssistaActionRegistryV2(self.shell, self.db, self.context, brain_ref=self)
+        self.llm      = AssistaLLM(self.config)
+        self.mapper   = AssistaPCMapper(self.db)
+        self.voice    = AssistaVoice(self)
+        # Modèle d'apprentissage (optionnel)
+        self.training_model = AssistaTrainingModel(ASSISTA_MODEL_DB_PATH) if AssistaTrainingModel else None
+
+        # État interne
+        self._conv_id        = str(uuid.uuid4())
+        self._history:       List[Dict] = []
+        self._pending_plan:  Optional[TaskPlan] = None
+        self._bootstrapped   = False
+        self._busy           = False
+        self._status         = ""
+        self._last_response  = ""
+        self._streaming_text = ""
+        self.autopilot       = False
+        self.hands_free      = False    # mode mains libres (voix permanente)
+        self._voice_confirm  = False
+        self._voice_confirm_prompt = ""
+        self._js_queue: List[str] = []
+        self._js_lock   = threading.Lock()
+        # Restaurer les préférences persistantes dès le départ
+        self.autopilot   = self.db.pref_get("autopilot", "false") == "true"
+        self.hands_free  = self.db.pref_get("hands_free", "false") == "true"
+        _auto_speak = self.db.pref_get("auto_speak", "false") == "true"
+        self.voice.auto_speak = _auto_speak
+
+    # ── Bootstrap ─────────────────────────────────────────────────────────────
+    def bootstrap(self) -> Dict:
+        with self._lock:
+            if self._bootstrapped:
+                # Déjà initialisé : retourne juste l'état courant sans nouveau message
+                return self._state()
+            self._bootstrapped = True
+            # Préférences
+            user_pref = self.db.pref_get("user.name", self.user_name)
+            if user_pref:
+                self.user_name = user_pref
+            # Démarrer le PC Mapper en arrière-plan (scan léger)
+            self.mapper.start(full=False)
+            pcmap_count = self.db.pcmap_count()
+            scan_msg = (f" (cartographie PC : {pcmap_count} entrées)"
+                        if pcmap_count > 0 else " (scan PC en cours…)")
+            msg = (
+                f"Bonjour {self.user_name} ! Je suis **ASSISTA v2**, votre assistante PC de nouvelle génération.{scan_msg}\n\n"
+                f"Je dispose de **10 agents spécialisés**, d'une base SQLite complète, "
+                f"et de nouveaux outils puissants : clipboard, notifications, planificateur, git, réseau, sécurité et plus encore.\n\n"
+                "Comment puis-je vous aider ?"
+            )
+            self._push("assista", msg)
+            return self._state(msg)
+
+    # ── Soumission ────────────────────────────────────────────────────────────
+    def submit(self, prompt: str, source: str = "text") -> Dict:
+        raw = (prompt or "").strip()
+        if not raw:
+            return self._state("Aucune demande reçue.")
+        if raw == "context_snapshot_internal":
+            return self._state(json.dumps(self.context.snapshot(), ensure_ascii=False, indent=2))
+        with self._lock:
+            if self._busy:
+                return self._state("Je traite déjà une demande, patientez…")
+            self._push("user", raw)
+            lower = normalize_text(raw)
+            if self._pending_plan and lower in {"oui", "ok", "vas-y", "go", "confirme", "autorise"}:
+                return self.approve_plan(self._pending_plan.id)
+            if self._pending_plan and lower in {"non", "annule", "stop", "refuse", "cancel"}:
+                return self.reject_plan(self._pending_plan.id)
+            self._busy   = True
+            self._status = "Analyse…"
+        threading.Thread(target=self._worker, args=(raw, source), daemon=True).start()
+        return self._state("Traitement en cours…")
+
+    # ── Plan approval ─────────────────────────────────────────────────────────
+    def approve_plan(self, plan_id: str) -> Dict:
+        with self._lock:
+            if self._busy:
+                return self._state("Je suis déjà occupée.")
+            if not self._pending_plan or self._pending_plan.id != plan_id:
+                return self._state("Aucun plan en attente.")
+            plan = self._pending_plan
+            self._pending_plan = None
+            self._busy   = True
+            self._status = "Exécution du plan…"
+        threading.Thread(target=self._execute_plan_bg, args=(plan, "✅ Plan approuvé."), daemon=True).start()
+        return self._state("Exécution en cours…")
+
+    def reject_plan(self, plan_id: str) -> Dict:
+        with self._lock:
+            if not self._pending_plan or self._pending_plan.id != plan_id:
+                return self._state("Aucun plan en attente.")
+            plan = self._pending_plan
+            self._pending_plan = None
+            msg = f"Plan annulé : {plan.summary}"
+            self._push("assista", msg)
+            self._last_response = msg
+            return self._state(msg)
+
+    # ── Contrôles ─────────────────────────────────────────────────────────────
+    def set_autopilot(self, enabled: bool) -> Dict:
+        with self._lock:
+            self.autopilot = bool(enabled)
+            msg = ("🤖 Autopilot activé." if self.autopilot else "🔒 Autopilot désactivé.")
+            self._push("assista", msg)
+            return self._state(msg)
+
+    def start_voice(self)         -> Dict: return self._state(self.voice.start_listening().get("message", ""))
+    def stop_voice(self)          -> Dict: return self._state(self.voice.stop_listening().get("message", ""))
+    def set_auto_speak(self, en)  -> Dict: return self._state(self.voice.toggle_auto_speak(en).get("message", ""))
+    def speak_last_response(self) -> Dict: return self._state(self.voice.speak(self._last_response).get("message", ""))
+    def stop_speaking(self)       -> Dict: return self._state(self.voice.stop_speaking().get("message", ""))
+
+    def mark_wake_event(self, phrase: str) -> None:
+        self._push("assista", f"🔔 Réveil vocal : « {phrase} »")
+
+    def mark_sleep_event(self, phrase: str) -> None:
+        self._push("assista", "💤 Mise en veille vocale.")
+
+    def set_hands_free(self, enabled: bool) -> Dict:
+        """Active/désactive le mode mains libres (voix permanente + auto-speak)."""
+        with self._lock:
+            self.hands_free = bool(enabled)
+            self.db.pref_set("hands_free", str(self.hands_free).lower())
+            if self.hands_free:
+                self.voice.auto_speak = True
+                self.db.pref_set("auto_speak", "true")
+                with self.voice._lock:
+                    self.voice._awake = True
+                msg = "🎙 Mode mains libres activé. Je vous écoute et réponds à voix haute."
+            else:
+                msg = "🔇 Mode mains libres désactivé."
+            self._push("assista", msg)
+            self._last_response = msg
+        if enabled:
+            self.voice.speak(msg)
+        return self._state(msg)
+
+    def teach_assista_model(
+        self,
+        user_phrase: str,
+        kind: str,
+        target: str = "",
+        command: str = "",
+        explanation: str = "",
+    ) -> Dict:
+        """Enseigne une nouvelle correspondance phrase→action au modèle d'apprentissage."""
+        if not self.training_model:
+            return {"ok": False, "message": "Modèle d'apprentissage non disponible."}
+        result = self.training_model.learn(user_phrase, kind, target, command, explanation)
+        if result.get("ok"):
+            msg = result.get("message", "Leçon enregistrée.")
+            self._push("assista", f"🎓 {msg}")
+        return result
+
+    # ── Config ────────────────────────────────────────────────────────────────
+    def get_config(self) -> Dict:
+        cfg = self.config.load()
+        key = cfg.get("api_key", "")
+        masked = (key[:6] + "…" + key[-4:]) if len(key) > 10 else ("*" * len(key) if key else "")
+        model  = cfg.get("model", DEFAULT_MODEL) or DEFAULT_MODEL
+        return {
+            "api_key":         key,
+            "api_key_masked":  masked,
+            "api_key_from_env": cfg.get("api_key_from_env", False),
+            "model":           model,
+            "model_is_auto":   model in ("__auto__", "", DEFAULT_MODEL),
+            "fallback_models": FALLBACK_MODELS,
+            "base_url":        cfg.get("base_url", DEFAULT_BASE_URL),
+        }
+
+    def save_config(self, api_key: str, model: str, base_url: str) -> Dict:
+        with self._lock:
+            self.config.save(api_key, model, base_url)
+            msg = "✅ Configuration API mise à jour."
+            self._push("assista", msg)
+            return self._state(msg)
+
+    # ── Mémoire & DB ──────────────────────────────────────────────────────────
+    def forget_memory(self) -> Dict:
+        self.memory.forget_all()
+        msg = "🗑 Mémoire effacée."
+        self._push("assista", msg)
+        return self._state(msg)
+
+    def get_memory(self) -> Dict:
+        facts = self.memory.get_facts(50)
+        turns = self.memory.get_recent_turns(self._conv_id, 20)
+        return {"ok": True, "facts": facts, "turns": turns}
+
+    def get_db_stats(self) -> Dict:
+        prop = self.registry.execute(ActionProposal(
+            id=str(uuid.uuid4()), kind="db_stats", title="Stats DB"
+        ))
+        return prop
+
+    def get_shell_log(self, n: int = 30) -> Dict:
+        return {"ok": True, "entries": self.db.audit_get(n)}
+
+    # ── PC Mapper ─────────────────────────────────────────────────────────────
+    def start_pc_mapper(self, full: bool = False, force: bool = None) -> Dict:
+        """Alias pour compatibilite avec assista_app.py et AssistaAPI."""
+        if force is not None:
+            full = bool(force)
+        return self.scan_pc(full=full)
+
+    def start_quick_scan(self) -> Dict:
+        self.mapper.start(full=False, quick=True)
+        msg = "Scan rapide lance en arriere-plan."
+        self._push("assista", msg)
+        self._last_response = msg
+        return {"ok": True, "message": msg}
+
+    def run_security_audit(self) -> Dict:
+        """Lance un audit de sécurité via AgentSecurite."""
+        prop = ActionProposal(
+            id=str(uuid.uuid4()), kind="security_scan", title="Audit sécurité"
+        )
+        result = self.registry.execute(prop)
+        msg = result.get("message", "Audit terminé.")
+        self._push("assista", msg)
+        self._last_response = msg
+        return {"ok": True, "message": msg,
+                "security_audit": {"summary": msg, "severity": "info"}}
+
+    def get_ops_state(self) -> Dict:
+        """État des opérations pour l'onglet OPS de l'UI Assista."""
+        try:
+            recent = self.db.history_get(self._conv_id, 10)
+            actions = [
+                {"kind": m.get("role", ""), "status": "OK",
+                 "title": truncate(m.get("content", ""), 60)}
+                for m in recent[-5:]
+                if m.get("role") == "assista"
+            ]
+        except Exception:
+            actions = []
+        return {
+            "ok": True,
+            "security_audit": {"summary": "Aucun audit lancé.", "severity": "none"},
+            "agent_sessions": [],
+            "routine_runs": [],
+            "recent_actions": actions,
+        }
+
+    def scan_pc(self, full: bool = False) -> Dict:
+        self.mapper.start(full=full)
+        return self._state("🗺️ Scan PC lancé en arrière-plan…")
+
+    def get_pcmap_stats(self) -> Dict:
+        stats = self.db.pcmap_stats()
+        prog  = self.mapper.progress
+        return {**stats, "mapper_status": prog}
+
+    # ── JS polling ────────────────────────────────────────────────────────────
+    def poll_js(self) -> List[str]:
+        with self._js_lock:
+            cmds = list(self._js_queue)
+            self._js_queue.clear()
+        return cmds
+
+    def _queue_js(self, js: str) -> None:
+        with self._js_lock:
+            self._js_queue.append(js)
+
+    # ── Analyse chemin ────────────────────────────────────────────────────────
+    def analyze_local_path(self, path_str: str) -> Dict:
+        path = Path(path_str.strip().strip('"\''))
+        if not path.exists():
+            return {"ok": False, "error": f"Introuvable : {path}",
+                    "message": f"❌ Chemin introuvable : `{path}`"}
+        if path.is_file():
+            result = self.registry.execute(ActionProposal(
+                id=str(uuid.uuid4()), kind="read_file",
+                title=f"Lire {path.name}", target=str(path)
+            ))
+            msg = result.get("message", "")
+            self.memory.add_fact(f"Fichier analysé : {path} ({path.stat().st_size} o)")
+            with self._lock:
+                self._push("assista", f"📄 Analyse de `{path.name}` :\n\n{truncate(msg, 3000)}")
+                self._last_response = msg
+            return {"ok": True, "message": msg, "path": str(path), "type": "file"}
+        if path.is_dir():
+            files_found = []
+            try:
+                for item in sorted(path.rglob("*"))[:200]:
+                    if item.is_file():
+                        files_found.append(str(item.relative_to(path)))
+            except Exception as e:
+                return {"ok": False, "error": str(e), "message": f"❌ {e}"}
+            lines = [f"📁 **Dossier :** `{path}`",
+                     f"📊 **{len(files_found)} fichiers**", "", "**Contenu :**"]
+            for f in files_found[:40]:
+                lines.append(f"  • `{f}`")
+            if len(files_found) > 40:
+                lines.append(f"  … et {len(files_found)-40} autres")
+            msg = "\n".join(lines)
+            self.memory.add_fact(f"Projet analysé : {path} ({len(files_found)} fichiers)")
+            with self._lock:
+                self._push("assista", msg); self._last_response = msg
+            return {"ok": True, "message": msg, "path": str(path), "type": "dir", "files": files_found[:40]}
+        return {"ok": False, "error": "Type inconnu", "message": f"❌ Type inconnu : {path}"}
+
+    # ── État complet ──────────────────────────────────────────────────────────
+    def get_state(self) -> Dict:
+        return self._state()
+
+    def _state(self, message: str = "") -> Dict:
+        with self._lock:
+            voice = self.voice.get_state()
+            self.voice.refresh_idle()
+            plan_data = None
+            if self._pending_plan:
+                plan_data = {
+                    "id":      self._pending_plan.id,
+                    "summary": self._pending_plan.summary,
+                    "steps": [
+                        {"title": s.title, "kind": s.kind, "target": s.target,
+                         "command": s.command, "risk": s.risk, "summary": s.summary}
+                        for s in self._pending_plan.steps
+                    ],
+                }
+            return {
+                "message":           message,
+                "status":            self._status,
+                "response":          self._last_response,
+                "streaming_text":    self._streaming_text,
+                "busy":              self._busy,
+                "autopilot":         self.autopilot,
+                "auto_speak":        self.voice.auto_speak,
+                "plan":              plan_data,
+                "plan_id":           self._pending_plan.id if self._pending_plan else None,
+                "voice_status":      voice["status"],
+                "voice_listening":   voice["listening"],
+                "voice_speaking":    voice["speaking"],
+                "voice_awake":       voice["awake"],
+                "voice_volume":      voice["volume"],
+                "voice_confirm":     self._voice_confirm,
+                "voice_confirm_msg": self._voice_confirm_prompt,
+                "history":           self._history[-40:],
+                "memory_facts_count": len(self.memory.get_facts(9999)),
+                "pcmap_count":       self.db.pcmap_count(),
+                "mapper_status":     self.mapper.progress["status"],
+                "version":           "2.0",
+            }
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  WORKER
+    # ══════════════════════════════════════════════════════════════════════════
+    def _worker(self, prompt: str, source: str) -> None:
+        try:
+            # [1] Routines automatisées (DB)
+            routine = self.db.routine_match(prompt)
+            if routine:
+                self._set_status(f"Routine : {routine['label']}")
+                steps = [
+                    ActionProposal(
+                        id=str(uuid.uuid4()), kind=s.get("kind", "run_shell"),
+                        title=s.get("title", ""), target=s.get("target", ""),
+                        command=s.get("command", ""), summary=s.get("summary", ""),
+                        meta=s.get("meta", {})
+                    )
+                    for s in routine["steps"]
+                ]
+                plan = TaskPlan(id=str(uuid.uuid4()), summary=routine["label"], steps=steps)
+                reviewed = self._review_plan(plan)
+                needs_confirm = any(s.requires_confirm for s in reviewed.steps)
+                if needs_confirm:
+                    self._ask_confirmation(reviewed, source)
+                    return
+                self._execute_plan_bg(reviewed, f"▶️ Routine : {routine['label']}")
+                return
+
+            # [2] Commandes prédéfinies
+            if _COMMANDS_AVAILABLE:
+                self._set_status("Recherche commande…")
+                matched = try_command_match(prompt)
+                if matched:
+                    proposal = ActionProposal(
+                        id=str(uuid.uuid4()), kind=matched["kind"],
+                        title=matched["title"], target=matched.get("target", ""),
+                        command=matched.get("command", ""), summary=matched.get("summary", ""),
+                        meta=matched.get("meta", {}),
+                    )
+                    reviewed = self.policy.review(proposal, self.autopilot, self.shell)
+                    if reviewed.requires_confirm:
+                        self._ask_confirmation(
+                            TaskPlan(id=str(uuid.uuid4()), summary=reviewed.title, steps=[reviewed]),
+                            source,
+                        )
+                        return
+                    result = self.registry.execute(reviewed)
+                    reply  = result.get("message", reviewed.summary)
+                    self._finalize(reply, prompt)
+                    if self.voice.auto_speak or source == "voice":
+                        self.voice.speak(reviewed.summary)
+                    return
+
+            # [3] LLM - planification JSON
+            self._set_status("Planification LLM...")
+            payload = self._plan_with_llm(prompt)
+            mode    = payload.get("mode", "chat")
+            steps   = self._build_steps(payload.get("steps") or [])
+
+            if mode == "action" and steps:
+                plan     = TaskPlan(id=str(uuid.uuid4()),
+                                    summary=payload.get("assistant_reply", "Plan"), steps=steps)
+                reviewed = self._review_plan(plan)
+                needs_confirm = any(s.requires_confirm or s.requires_approval for s in reviewed.steps)
+                if needs_confirm:
+                    self._ask_confirmation(reviewed, source)
+                    return
+                self._execute_plan_bg(reviewed, payload.get("assistant_reply", reviewed.summary))
+                return
+
+            # [4] Chat direct
+            reply = payload.get("assistant_reply", "").strip()
+            if not reply:
+                self._set_status("Génération réponse…")
+                reply = self._stream_response(prompt)
+            self._finalize(reply, prompt)
+            if self.voice.auto_speak or source == "voice":
+                self.voice.speak(reply)
+
+        except Exception as exc:
+            with self._lock:
+                msg = f"⚠️ Erreur ASSISTA v2 : {exc}"
+                self._push("assista", msg)
+                self._last_response = msg
+                self._busy  = False
+                self._status = ""
+
+    def _ask_confirmation(self, plan: TaskPlan, source: str) -> None:
+        summary = "\n".join(f"• [{s.risk.upper()}] {s.title}" for s in plan.steps)
+        msg = (
+            f"**Plan nécessitant votre validation :**\n\n{summary}\n\n"
+            "Approuvez ou annulez via les boutons, ou répondez « oui » / « non »."
+        )
+        with self._lock:
+            self._pending_plan           = plan
+            self._voice_confirm          = source == "voice"
+            self._voice_confirm_prompt   = f"Je vais exécuter : {plan.summary}. Confirmez-vous ?"
+            self._push("assista", msg)
+            self._last_response = msg
+            self._busy   = False
+            self._status = "En attente de validation."
+        if source == "voice":
+            self.voice.speak(self._voice_confirm_prompt)
+
+    def _execute_plan_bg(self, plan: TaskPlan, prefix: str) -> None:
+        try:
+            self._set_status("Exécution du plan…")
+            parts = [prefix] if prefix else []
+            for i, step in enumerate(plan.steps, 1):
+                self._set_status(f"Étape {i}/{len(plan.steps)} : {step.title}…")
+                self._queue_js(f"assistaSetStatus({json.dumps(f'⚙️ {i}/{len(plan.steps)} — {step.title}')})")
+                result = self.registry.execute(step)
+                if result.get("_speak"):
+                    self.voice.speak(result["_speak"])
+                msg = result.get("message", "")
+                parts.append(f"**Étape {i} — {step.title}**\n{msg}")
+                self._queue_js(f"assistaStepDone({json.dumps(step.title)}, {json.dumps('ok' if result.get('ok') else 'error')})")
+            reply = "\n\n".join(filter(None, parts))
+            self._finalize(reply, plan.summary)
+        except Exception as exc:
+            with self._lock:
+                msg = f"⚠️ Erreur exécution plan : {exc}"
+                self._push("assista", msg)
+                self._last_response = msg
+                self._busy  = False
+                self._status = ""
+
+    # ── LLM ───────────────────────────────────────────────────────────────────
+    def _plan_with_llm(self, prompt: str) -> Dict:
+        facts  = self.memory.get_facts(30)
+        recent = self.memory.get_recent_turns(self._conv_id, 6)
+        ctx    = self.context.snapshot()
+        stats  = self.db.pcmap_stats()
+        history = [
+            {"role": "user" if m["role"] == "user" else "assistant", "content": m["text"]}
+            for m in self._history[-MAX_HISTORY_TURNS * 2:]
+            if m["role"] in ("user", "assista")
+        ]
+        user_payload = {
+            "prompt":  prompt,
+            "history": history,
+            "memory":  {"facts": facts, "recent_turns": recent},
+            "context": ctx,
+            "db_stats": stats,
+            "tools":   self._tools_schema(),
+        }
+        payload = self.llm.complete_json([
+            {"role": "system", "content": SYSTEM_PROMPT_V2},
+            {"role": "user",   "content": json.dumps(user_payload, ensure_ascii=False)},
+        ])
+        for fact in payload.get("remember", []) or []:
+            self.memory.add_fact(str(fact))
+        return payload
+
+    def _stream_response(self, prompt: str) -> str:
+        history = [
+            {"role": "user" if m["role"] == "user" else "assistant", "content": m["text"]}
+            for m in self._history[-MAX_HISTORY_TURNS * 2:]
+            if m["role"] in ("user", "assista")
+        ]
+        msgs   = [{"role": "system", "content": SYSTEM_PROMPT_V2}] + history
+        tokens = []
+        self._queue_js("assistaStreamStart()")
+        def on_token(t):
+            tokens.append(t)
+            with self._lock:
+                self._streaming_text = "".join(tokens)
+            self._queue_js(f"assistaStreamToken({json.dumps(t)})")
+        result = self.llm.stream_chat(msgs, on_token=on_token)
+        self._queue_js("assistaStreamEnd()")
+        return result
+
+    def _tools_schema(self) -> List[Dict]:
+        return [
+            {"kind": "context",           "when": "lire état du PC et contexte bureau"},
+            {"kind": "capture_screen",    "when": "capturer l'écran"},
+            {"kind": "analyze_screen",    "when": "capturer + OCR"},
+            {"kind": "play_media",        "when": "jouer musique/vidéo"},
+            {"kind": "open_app",          "when": "lancer application"},
+            {"kind": "open_url",          "when": "ouvrir URL"},
+            {"kind": "open_path",         "when": "ouvrir fichier/dossier"},
+            {"kind": "list_dir",          "when": "lister dossier"},
+            {"kind": "search_files",      "when": "chercher fichiers par nom"},
+            {"kind": "search_file_content", "when": "chercher dans contenu fichiers"},
+            {"kind": "read_file",         "when": "lire fichier (txt/py/json/pdf/docx/xlsx)"},
+            {"kind": "create_text_file",  "when": "créer/écrire fichier texte"},
+            {"kind": "delete_file",       "when": "supprimer fichier/dossier"},
+            {"kind": "move_file",         "when": "déplacer/renommer"},
+            {"kind": "copy_file",         "when": "copier fichier/dossier"},
+            {"kind": "zip_files",         "when": "créer archive ZIP"},
+            {"kind": "extract_zip",       "when": "extraire archive ZIP"},
+            {"kind": "hash_file",         "when": "calculer hash SHA256/MD5"},
+            {"kind": "diff_files",        "when": "comparer deux fichiers"},
+            {"kind": "run_shell",         "when": "commande shell complexe non couverte"},
+            {"kind": "run_python",        "when": "exécuter code Python inline"},
+            {"kind": "run_script",        "when": "exécuter script fichier"},
+            {"kind": "git_status",        "when": "git status"},
+            {"kind": "git_commit",        "when": "git add + commit", "meta": {"message": "msg"}},
+            {"kind": "git_push",          "when": "git push"},
+            {"kind": "git_pull",          "when": "git pull"},
+            {"kind": "install_package",   "when": "installer package pip/npm/choco", "target": "pip:nom"},
+            {"kind": "uninstall_package", "when": "désinstaller package"},
+            {"kind": "list_packages",     "when": "lister packages installés"},
+            {"kind": "network_info",      "when": "IP locale, interfaces réseau"},
+            {"kind": "ping_host",         "when": "pinger un hôte"},
+            {"kind": "network_scan",      "when": "scanner réseau local /24"},
+            {"kind": "port_scan",         "when": "scanner ports d'un hôte"},
+            {"kind": "system_info",       "when": "CPU/RAM/disque/uptime"},
+            {"kind": "list_processes",    "when": "lister processus actifs"},
+            {"kind": "kill_process",      "when": "tuer processus par nom"},
+            {"kind": "env_get",           "when": "lire variable d'environnement"},
+            {"kind": "env_set",           "when": "définir variable d'environnement"},
+            {"kind": "clipboard_read",    "when": "lire presse-papier"},
+            {"kind": "clipboard_write",   "when": "écrire dans presse-papier"},
+            {"kind": "notify",            "when": "envoyer notification système"},
+            {"kind": "notify_toast",      "when": "notification toast Windows"},
+            {"kind": "schedule",          "when": "planifier tâche", "meta": {"delay_s": 60, "interval_s": 0}},
+            {"kind": "schedule_list",     "when": "lister tâches planifiées"},
+            {"kind": "schedule_cancel",   "when": "annuler tâche planifiée"},
+            {"kind": "routine_add",       "when": "créer routine automatisée"},
+            {"kind": "routine_list",      "when": "lister routines"},
+            {"kind": "db_query",          "when": "requête SQL SELECT sur base ASSISTA"},
+            {"kind": "db_pcmap_search",   "when": "chercher dans cartographie PC SQLite"},
+            {"kind": "db_stats",          "when": "statistiques base de données ASSISTA"},
+            {"kind": "speak_text",        "when": "lire texte à voix haute"},
+            {"kind": "security_scan",     "when": "scan sécurité processus + ports"},
+            {"kind": "audit_log",         "when": "afficher journal commandes shell"},
+        ]
+
+    def _build_steps(self, raw_steps: List[Dict]) -> List[ActionProposal]:
+        steps = []
+        for item in raw_steps:
+            kind = str(item.get("kind", "")).strip()
+            if not kind:
+                continue
+            target  = str(item.get("target", "")).strip()
+            command = str(item.get("command", target)).strip() or target
+            prop = ActionProposal(
+                id=str(uuid.uuid4()), kind=kind,
+                title=str(item.get("title", kind)).strip() or kind,
+                target=target, command=command,
+                summary=str(item.get("summary", kind)).strip() or kind,
+                meta=item.get("meta") or {},
+                risk=str(item.get("risk", "safe")),
+            )
+            if kind == "run_shell" and not prop.command:
+                continue
+            steps.append(prop)
+        return steps
+
+    def _review_plan(self, plan: TaskPlan) -> TaskPlan:
+        reviewed = [self.policy.review(s, self.autopilot, self.shell) for s in plan.steps]
+        return TaskPlan(id=plan.id, summary=plan.summary, steps=reviewed, created_at=plan.created_at)
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    def _push(self, role: str, text: str) -> None:
+        self._history.append({"role": role, "text": text, "ts": now_iso()})
+        if role in ("user", "assista"):
+            self.db.history_add(self._conv_id, role, text)
+
+    def _set_status(self, status: str) -> None:
+        with self._lock:
+            self._status = status
+
+    def _finalize(self, response: str, prompt: str = "") -> None:
+        display = response
+        try:
+            parsed = json.loads(response)
+            if isinstance(parsed, dict) and parsed.get("assistant_reply"):
+                display = parsed["assistant_reply"].strip()
+        except Exception:
+            pass
+        with self._lock:
+            self._push("assista", display)
+            self._last_response  = display
+            self._streaming_text = ""
+            self._busy   = False
+            self._status = ""
+            _auto_speak  = self.voice.auto_speak
+        if prompt:
+            self.memory.remember_turn(self._conv_id, prompt, display)
+        if _auto_speak:
+            threading.Thread(target=self.voice.speak, args=(display,), daemon=True).start()
+
+
+# ── Alias de rétrocompatibilité ────────────────────────────────────────────────
+AssistaBrain = AssistaBrainV2
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  COUCHE API BRIDGE — AssistaAPI
+#  Exposée via pywebview.js_api → traduit les appels UI vers AssistaBrainV2
+#  Nommage exact attendu par assista_ui.py
+# ══════════════════════════════════════════════════════════════════════════════
+class AssistaAPI:
+    """
+    Bridge entre pywebview (JS) et AssistaBrainV2 (Python).
+    Toutes les méthodes sont appelées depuis assista_ui.py.
+    """
+
+    def __init__(self, brain: AssistaBrainV2) -> None:
+        self._brain = brain
+
+    # ── Initialisation ────────────────────────────────────────────────────
+    def init_session(self) -> Dict:
+        """Appelé au démarrage de l'UI — équivalent de bootstrap()."""
+        return self._brain.bootstrap()
+
+    # ── Chat ─────────────────────────────────────────────────────────────
+    def submit_prompt(self, prompt: str) -> Dict:
+        """Envoi d'un prompt utilisateur (texte ou voix)."""
+        return self._brain.submit(prompt, source="text")
+
+    def approve_plan(self, plan_id: str) -> Dict:
+        return self._brain.approve_plan(plan_id)
+
+    def reject_plan(self, plan_id: str) -> Dict:
+        return self._brain.reject_plan(plan_id)
+
+    # ── État ─────────────────────────────────────────────────────────────
+    def get_state(self) -> Dict:
+        """État complet pour le polling UI (toutes les 180 ms)."""
+        state = self._brain.get_state()
+        # Enrichit le state avec les données mapper pour refreshCtx()
+        prog = self._brain.mapper.progress
+        state["mapper"] = {
+            "running":          prog.get("running", False),
+            "progress_percent": prog.get("progress_percent", 0),
+            "message":          prog.get("message", ""),
+            "current_root":     prog.get("current_root", ""),
+            "current_path":     prog.get("current_path", ""),
+            "scanned_files":    prog.get("scanned_files", 0),
+            "scanned_dirs":     prog.get("scanned_dirs", 0),
+            "last_scan":        {"notes": {}, "scanned_files": prog.get("scanned_files", 0)},
+        }
+        # db_stats pour refreshCtx()
+        try:
+            db_s = self._brain.db.pcmap_stats()
+            history_count = len(self._brain.db.history_get(self._brain._conv_id, 9999))
+            state["db_stats"] = {
+                "db_path":  str(DB_PATH),
+                "messages": history_count,
+                "total":    db_s.get("total", 0),
+                "files":    db_s.get("files", 0),
+                "dirs":     db_s.get("dirs", 0),
+            }
+        except Exception:
+            state["db_stats"] = {}
+        state["agents_count"]  = 0
+        state["routines_count"]= 0
+        return state
+
+    def poll_js(self) -> List[str]:
+        """Retourne les commandes JS en attente (streaming tokens)."""
+        return self._brain.poll_js()
+
+    # ── Voix ─────────────────────────────────────────────────────────────
+    def start_voice(self) -> Dict:
+        return self._brain.start_voice()
+
+    def stop_voice(self) -> Dict:
+        return self._brain.stop_voice()
+
+    def set_auto_speak(self, enabled: bool) -> Dict:
+        return self._brain.set_auto_speak(enabled)
+
+    def speak_last_response(self) -> Dict:
+        return self._brain.speak_last_response()
+
+    def stop_speaking(self) -> Dict:
+        return self._brain.stop_speaking()
+
+    # ── Contrôles ─────────────────────────────────────────────────────────
+    def set_autopilot(self, enabled: bool) -> Dict:
+        return self._brain.set_autopilot(enabled)
+
+    # ── Config ────────────────────────────────────────────────────────────
+    def get_config(self) -> Dict:
+        return self._brain.get_config()
+
+    def save_config(self, api_key: str, model: str, base_url: str) -> Dict:
+        return self._brain.save_config(api_key, model, base_url)
+
+    # ── Mémoire ───────────────────────────────────────────────────────────
+    def get_memory(self) -> Dict:
+        return self._brain.get_memory()
+
+    def forget_memory(self) -> Dict:
+        return self._brain.forget_memory()
+
+    # ── Shell log ─────────────────────────────────────────────────────────
+    def get_shell_log(self, n: int = 30) -> Dict:
+        return self._brain.get_shell_log(n)
+
+    # ── PC Mapper ─────────────────────────────────────────────────────────
+    def start_pc_mapper(self, full: bool = False) -> Dict:
+        """Lance le scan complet du PC."""
+        self._brain.mapper.start(full=full, quick=False)
+        return {"ok": True, "message": "🔍 Scan PC complet lancé en arrière-plan."}
+
+    def start_quick_scan(self) -> Dict:
+        """Lance un scan rapide (dossiers importants seulement, max 5 000 fichiers)."""
+        self._brain.mapper.start(full=False, quick=True)
+        return {"ok": True, "message": "⚡ Scan rapide lancé (Bureau, Documents, Downloads…)"}
+
+    def get_ops_state(self) -> Dict:
+        """
+        État des opérations système pour l'onglet OPS de l'UI.
+        Retourne les actions récentes, sessions agents, routines.
+        """
+        try:
+            recent = self._brain.db.get_history(self._brain._conv_id, limit=10)
+            actions = [
+                {"kind": m.get("role",""), "status": "OK",
+                 "title": truncate(m.get("content",""), 60)}
+                for m in recent[-5:]
+                if m.get("role") == "assista"
+            ]
+        except Exception:
+            actions = []
+        return {
+            "ok":             True,
+            "security_audit": {"summary": "Aucun audit lancé.", "severity": "none"},
+            "agent_sessions": [],
+            "routine_runs":   [],
+            "recent_actions": actions,
+        }
+
+    def run_security_audit(self) -> Dict:
+        """Lance un audit de sécurité basique via shell."""
+        results = []
+        shell = self._brain.shell if hasattr(self._brain, "shell") else None
+        if shell:
+            # Vérifie les ports ouverts (Windows)
+            if platform.system() == "Windows":
+                r = shell.run("netstat -ano | Select-String 'LISTENING' | Select-Object -First 20 | Out-String",
+                              timeout=10)
+            else:
+                r = shell.run("ss -tlnp 2>/dev/null | head -20", timeout=10)
+            results.append(r.get("stdout", "") or r.get("stderr", ""))
+        summary = f"Ports ouverts analysés. {len(results)} vérification(s)."
+        msg = f"🔒 Audit terminé : {summary}"
+        self._brain._push("assista", msg)
+        self._brain._last_response = msg
+        return {"ok": True, "message": msg,
+                "security_audit": {"summary": summary, "severity": "info"}}
+
+    # ── Analyse chemin local ───────────────────────────────────────────────
+    def analyze_local_path(self, path_str: str) -> Dict:
+        return self._brain.analyze_local_path(path_str)
+
+    # ── Scan PC (alias) ───────────────────────────────────────────────────
+    def scan_pc(self, full: bool = False) -> Dict:
+        return self.start_pc_mapper(full=full)
